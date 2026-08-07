@@ -4,7 +4,6 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.oddscanner.parser.AbstractBookmakerParser;
-import com.oddscanner.parser.ParseResult; // <-- Новый импорт
 import com.oddscanner.parser.RawEvent;
 import com.oddscanner.repository.EventRepository;
 import io.micrometer.core.instrument.MeterRegistry;
@@ -34,10 +33,6 @@ public class PolymarketParser extends AbstractBookmakerParser {
     private final HttpClient httpClient;
     private final ObjectMapper objectMapper;
 
-    // Кэш тегов
-    private List<String> cachedSportsSlugs = new ArrayList<>();
-    private Instant lastTagsFetch = Instant.EPOCH;
-
     private static final Pattern FULL_TEAMS_PATTERN = Pattern.compile(
             "([A-Z][a-zA-Z\\s\\-']+?)\\s+vs\\.?\\s+([A-Z][a-zA-Z\\s\\-']+?)(?:\\s+-|\\s*$|\\s+\\?)"
     );
@@ -63,8 +58,6 @@ public class PolymarketParser extends AbstractBookmakerParser {
         List<RawEvent> allEvents = new ArrayList<>();
         int skippedCount = 0;
 
-        log.info("[Polymarket] Начинаю парсинг...");
-
         // 1. Получаем теги
         List<String> sportsSlugs = fetchSportsSlugs();
         if (sportsSlugs.isEmpty()) {
@@ -88,15 +81,15 @@ public class PolymarketParser extends AbstractBookmakerParser {
                         if (processedEventIds.contains(eventId)) continue;
                         processedEventIds.add(eventId);
 
-                        // Используем внешний класс ParseResult
-                        ParseResult<RawEvent> result = parseEvent(eventNode);
+                        // ИСПРАВЛЕНИЕ: parseEvent возвращает RawEvent или null
+                        RawEvent event = parseEvent(eventNode);
 
-                        if (result.isSuccess()) {
-                            allEvents.add(result.getData());
+                        if (event != null) {
+                            allEvents.add(event);
                         } else {
                             skippedCount++;
                             if (log.isTraceEnabled()) {
-                                log.trace("[Polymarket] Skip {}: {}", eventId, result.getSkipReason());
+                                log.trace("[Polymarket] Skip event: {}", eventId);
                             }
                         }
                     }
@@ -129,28 +122,30 @@ public class PolymarketParser extends AbstractBookmakerParser {
         return allEvents;
     }
 
-    // Метод теперь возвращает ParseResult<RawEvent>
-    private ParseResult<RawEvent> parseEvent(JsonNode eventNode) {
+    /**
+     * Парсит одно событие. Возвращает RawEvent если всё ок, null если событие не подходит.
+     */
+    private RawEvent parseEvent(JsonNode eventNode) {
         String eventId = eventNode.path("id").asText();
         String title = eventNode.path("title").asText();
         boolean closed = eventNode.path("closed").asBoolean(false);
         boolean active = eventNode.path("active").asBoolean(true);
 
         if (closed || !active) {
-            return ParseResult.skip("closed/inactive");
+            return null;
         }
 
-        LocalDateTime endTime = parseDate(eventNode, "endDate");
+        LocalDateTime endTime = parseEndDate(eventNode);
         LocalDateTime now = LocalDateTime.now();
         if (endTime != null && (endTime.isBefore(now) || endTime.isAfter(now.plusDays(30)))) {
-            return ParseResult.skip("time window");
+            return null;
         }
 
         String[] teams = extractTeams(title);
 
         JsonNode marketsNode = eventNode.path("markets");
         if (!marketsNode.isArray() || marketsNode.isEmpty()) {
-            return ParseResult.skip("no markets array");
+            return null;
         }
 
         List<RawEvent.RawMarket> parsedMarkets = new ArrayList<>();
@@ -160,7 +155,6 @@ public class PolymarketParser extends AbstractBookmakerParser {
                 continue;
             }
 
-            String question = marketNode.path("question").asText();
             List<String> outcomes = parseJsonArray(marketNode.path("outcomes"));
             List<String> prices = findPrices(marketNode);
 
@@ -168,21 +162,21 @@ public class PolymarketParser extends AbstractBookmakerParser {
                 continue;
             }
 
-            RawEvent.RawMarket market = parseMarket(question, outcomes, prices);
+            RawEvent.RawMarket market = parseMarket(outcomes, prices);
             if (market != null) {
                 parsedMarkets.add(market);
             }
         }
 
         if (parsedMarkets.isEmpty()) {
-            return ParseResult.skip("no valid markets");
+            return null;
         }
 
         String team1 = teams != null ? teams[0] : "Unknown";
         String team2 = teams != null ? teams[1] : "Unknown";
 
         if (teams == null && !parsedMarkets.isEmpty()) {
-            RawEvent.RawMarket first = parsedMarkets.get(0);
+            RawEvent.RawMarket first = parsedMarkets.getFirst();
             if ("Moneyline".equals(first.marketType()) && first.outcomes().size() == 2) {
                 team1 = first.outcomes().get(0).name();
                 team2 = first.outcomes().get(1).name();
@@ -192,18 +186,10 @@ public class PolymarketParser extends AbstractBookmakerParser {
         String url = "https://polymarket.com/event/" + eventNode.path("slug").asText();
         LocalDateTime startTime = endTime != null ? endTime : now.plusDays(1);
 
-        RawEvent event = new RawEvent(
-                eventId,
-                "Sport",
-                "Polymarket",
-                team1,
-                team2,
-                startTime,
-                parsedMarkets,
-                url
+        return new RawEvent(
+                eventId, "Sport", "Polymarket",
+                team1, team2, startTime, parsedMarkets, url
         );
-
-        return ParseResult.success(event);
     }
 
     private String[] extractTeams(String text) {
@@ -219,10 +205,9 @@ public class PolymarketParser extends AbstractBookmakerParser {
         return null;
     }
 
-    private RawEvent.RawMarket parseMarket(String question, List<String> outcomes, List<String> prices) {
-        // ... (логика parseMarket остается без изменений) ...
-        String q = question.toLowerCase();
+    private RawEvent.RawMarket parseMarket(List<String> outcomes, List<String> prices) {
 
+        // 1X2
         if (outcomes.size() == 3) {
             int drawIndex = -1;
             for (int i = 0; i < outcomes.size(); i++) {
@@ -236,7 +221,7 @@ public class PolymarketParser extends AbstractBookmakerParser {
                 List<RawEvent.RawOutcome> marketOutcomes = new ArrayList<>();
                 for (int i = 0; i < outcomes.size(); i++) {
                     double price = Double.parseDouble(prices.get(i));
-                    if (price > 0.01 && price < 0.99) {
+                    if (price > 0.001 && price < 0.999) {
                         marketOutcomes.add(new RawEvent.RawOutcome(outcomes.get(i), convertPrice(price)));
                     }
                 }
@@ -252,13 +237,16 @@ public class PolymarketParser extends AbstractBookmakerParser {
             String o1Low = o1.toLowerCase();
             String o2Low = o2.toLowerCase();
 
-            boolean isYesNo = (o1Low.equals("yes") && o2Low.equals("no")) || (o1Low.equals("no") && o2Low.equals("yes"));
-            boolean isOverUnder = (o1Low.equals("over") && o2Low.equals("under")) || (o1Low.equals("under") && o2Low.equals("over"));
+            boolean isYesNo = (o1Low.equals("yes") && o2Low.equals("no"))
+                    || (o1Low.equals("no") && o2Low.equals("yes"));
+            boolean isOverUnder = (o1Low.equals("over") && o2Low.equals("under"))
+                    || (o1Low.equals("under") && o2Low.equals("over"));
 
+            // Total (Over/Under)
             if (isOverUnder) {
                 double price1 = Double.parseDouble(prices.get(0));
                 double price2 = Double.parseDouble(prices.get(1));
-                if (price1 > 0.01 && price1 < 0.99 && price2 > 0.01 && price2 < 0.99) {
+                if (price1 > 0.001 && price1 < 0.999 && price2 > 0.001 && price2 < 0.999) {
                     List<RawEvent.RawOutcome> marketOutcomes = new ArrayList<>();
                     if (o1Low.equals("over")) {
                         marketOutcomes.add(new RawEvent.RawOutcome("Over", convertPrice(price1)));
@@ -271,10 +259,12 @@ public class PolymarketParser extends AbstractBookmakerParser {
                 }
             }
 
+            // Moneyline (названия команд — KBO, NPB, CPBL, NFL и т.д.)
             if (!isYesNo && !isOverUnder) {
                 double price1 = Double.parseDouble(prices.get(0));
                 double price2 = Double.parseDouble(prices.get(1));
-                if (price1 > 0.01 && price1 < 0.99 && price2 > 0.01 && price2 < 0.99) {
+                // Расширенный фильтр: принимаем любые цены от 0.001 до 0.999
+                if (price1 > 0.001 && price1 < 0.999 && price2 > 0.001 && price2 < 0.999) {
                     List<RawEvent.RawOutcome> marketOutcomes = new ArrayList<>();
                     marketOutcomes.add(new RawEvent.RawOutcome(o1, convertPrice(price1)));
                     marketOutcomes.add(new RawEvent.RawOutcome(o2, convertPrice(price2)));
@@ -282,10 +272,11 @@ public class PolymarketParser extends AbstractBookmakerParser {
                 }
             }
 
+            // MatchWinner (Yes/No)
             if (isYesNo) {
                 double price1 = Double.parseDouble(prices.get(0));
                 double price2 = Double.parseDouble(prices.get(1));
-                if (price1 > 0.01 && price1 < 0.99 && price2 > 0.01 && price2 < 0.99) {
+                if (price1 > 0.001 && price1 < 0.999 && price2 > 0.001 && price2 < 0.999) {
                     List<RawEvent.RawOutcome> marketOutcomes = new ArrayList<>();
                     marketOutcomes.add(new RawEvent.RawOutcome(o1, convertPrice(price1)));
                     marketOutcomes.add(new RawEvent.RawOutcome(o2, convertPrice(price2)));
@@ -293,33 +284,24 @@ public class PolymarketParser extends AbstractBookmakerParser {
                 }
             }
         }
+
         return null;
     }
 
     private List<String> fetchSportsSlugs() {
-        if (Duration.between(lastTagsFetch, Instant.now()).toHours() < 1 && !cachedSportsSlugs.isEmpty()) {
-            return cachedSportsSlugs;
-        }
-
         try {
             String url = API_BASE_URL + "/sports";
             JsonNode sportsArray = fetchJsonArray(url);
             if (sportsArray != null && sportsArray.isArray()) {
                 List<String> slugs = new ArrayList<>();
                 for (JsonNode sport : sportsArray) {
-                    if (sport.has("series_slug")) {
-                        slugs.add(sport.get("series_slug").asText());
-                    }
-                    if (sport.has("tags") && sport.get("tags").isArray()) {
-                        for (JsonNode tag : sport.get("tags")) {
-                            if (tag.has("slug")) slugs.add(tag.get("slug").asText());
-                        }
+                    // ИСПРАВЛЕНИЕ: читаем поле "sport" из ответа API
+                    if (sport.has("sport")) {
+                        slugs.add(sport.get("sport").asText());
                     }
                 }
                 if (!slugs.isEmpty()) {
-                    cachedSportsSlugs = slugs.stream().distinct().collect(Collectors.toList());
-                    lastTagsFetch = Instant.now();
-                    return cachedSportsSlugs;
+                    return slugs.stream().distinct().collect(Collectors.toList());
                 }
             }
         } catch (Exception e) {
@@ -329,13 +311,15 @@ public class PolymarketParser extends AbstractBookmakerParser {
     }
 
     private List<String> getFallbackSlugs() {
-        return List.of("sports", "soccer", "football", "nba", "nfl", "tennis", "nhl", "mlb", "ufc", "boxing", "mma", "hockey", "baseball", "cricket");
+        return List.of("sports", "soccer", "football", "nba", "nfl", "tennis",
+                "nhl", "mlb", "ufc", "boxing", "mma", "hockey", "baseball", "cricket");
     }
 
     private JsonNode fetchJsonArray(String url) throws Exception {
         HttpRequest request = HttpRequest.newBuilder()
                 .uri(URI.create(url))
                 .header("Accept", "application/json")
+                .timeout(Duration.ofSeconds(10))
                 .GET()
                 .build();
 
@@ -381,8 +365,8 @@ public class PolymarketParser extends AbstractBookmakerParser {
         return new ArrayList<>();
     }
 
-    private LocalDateTime parseDate(JsonNode node, String field) {
-        String dateStr = node.path(field).asText(null);
+    private LocalDateTime parseEndDate(JsonNode node) {
+        String dateStr = node.path("endDate").asText(null);
         if (dateStr != null && !dateStr.isEmpty()) {
             try {
                 return LocalDateTime.ofInstant(Instant.parse(dateStr), ZoneId.systemDefault());
@@ -392,5 +376,4 @@ public class PolymarketParser extends AbstractBookmakerParser {
         }
         return null;
     }
-
 }
