@@ -199,4 +199,10 @@ ALTER TABLE outcomes DROP CONSTRAINT IF EXISTS fk_outcomes_market;
 ALTER TABLE outcomes ADD CONSTRAINT fk_outcomes_market
     FOREIGN KEY (market_id) REFERENCES markets(id) ON DELETE CASCADE;
 
---rollback DROP TABLE outcomes;
+--changeset Ilya:v_1.0_id_1.9
+--comment: Добавление букмекера Winline
+INSERT INTO bookmakers (code, name, api_base_url, is_active) VALUES
+    ('WINLINE', 'Winline', 'https://winline.ru', true)
+ON CONFLICT (code) DO NOTHING;
+
+--rollback DELETE FROM bookmakers WHERE code = 'WINLINE';
