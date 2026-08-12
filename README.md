@@ -24,7 +24,7 @@ Swagger UI: http://localhost:8080/swagger-ui.html
 markdown
 12345678
 # OddScanner MVP## Запуск приложения1. Убедитесь, что Docker и Docker Compose установлены.2. Запустите PostgreSQL с помощью команды:   ```bash   docker-compose up -d
-Дождитесь, пока PostgreSQL запустится и Flyway выполнит миграции.
+Дождитесь, пока PostgreSQL запустится и Liquibase выполнит миграции.
 Запустите приложение Spring Boot:
 Через IDE: запустите OddScannerApplication.main().
 Через Maven: mvn spring-boot:run.

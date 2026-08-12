@@ -1,29 +1,53 @@
-# Target directory (Maven)
+# ===== Maven =====
 target/
 **/target/
+!.mvn/wrapper/maven-wrapper.jar
 
-# jOOQ generated sources (добавить оба варианта)
+# ===== jOOQ generated sources =====
 target/generated-sources/
 **/generated/
 
-# Compiled class files
+# ===== Compiled class files =====
 **/*.class
 
-# JAR/WAR files
+# ===== JAR/WAR =====
 *.jar
 *.war
+!mvnw
+!mvnw.cmd
 
-# IDE files
+# ===== IDE =====
 .idea/
 *.iml
+*.iws
+*.ipr
 .DS_Store
 .vscode/
+*.swp
+*.swo
 
-# Logs
+# ===== OS files =====
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# ===== Logs =====
 *.log
 logs/
 
-# Local configs
+# ===== Playwright =====
+playwright/
+.ms-playwright/
+**/playwright-artifacts/
+
+# ===== Local configs =====
 application-local.yml
 application-*.yml
+!application.yml
 !application-default.yml
+
+# ===== Debug / temp files =====
+*.png
+!src/main/resources/**/*.png
+*_debug.html
+powershell.command
