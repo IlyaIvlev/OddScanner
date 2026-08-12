@@ -11,10 +11,7 @@ import org.springframework.stereotype.Component;
 
 import java.math.BigDecimal;
 import java.time.LocalDateTime;
-import java.util.ArrayList;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Set;
+import java.util.*;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
@@ -24,6 +21,9 @@ import java.util.stream.Collectors;
 public class WinlineParser extends AbstractBookmakerParser {
 
     private static final String BASE_URL = "https://winline.ru";
+
+    // href и видимый текст ссылки на карточку события, снятые из DOM
+    private record EventLink(String href, String text) {}
 
     public WinlineParser(MeterRegistry meterRegistry, EventRepository eventRepository) {
         super(meterRegistry, eventRepository);
@@ -55,7 +55,6 @@ public class WinlineParser extends AbstractBookmakerParser {
 
                 Page page = context.newPage();
 
-                // Stealth: убираем webdriver-флаг
                 page.addInitScript("""
                             Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
                             Object.defineProperty(navigator, 'languages', { get: () => ['ru-RU', 'ru', 'en'] });
@@ -63,27 +62,27 @@ public class WinlineParser extends AbstractBookmakerParser {
                             window.chrome = { runtime: {} };
                         """);
 
-                //log.debug("[Winline] Открываю главную страницу...");
                 page.navigate(BASE_URL, new Page.NavigateOptions()
-                        .setTimeout(90_000)  // было 60_000
-                        .setWaitUntil(WaitUntilState.DOMCONTENTLOADED));  // было NETWORKIDLE
+                        .setTimeout(90_000)
+                        .setWaitUntil(WaitUntilState.DOMCONTENTLOADED));
 
-                // Ждём появления коэффициентов — увеличим таймаут
                 try {
                     page.waitForSelector("text=/\\d+\\.\\d{2}/", new Page.WaitForSelectorOptions()
-                            .setTimeout(30_000));  // было 15_000
+                            .setTimeout(30_000));
                 } catch (Exception e) {
                     log.warn("[Winline] Не удалось дождаться коэффициентов: {}", e.getMessage());
                 }
 
-                page.waitForTimeout(7000);  // было 5000 — дадим странице дорендериться
+                page.waitForTimeout(7000);
 
-                // Извлекаем текст страницы
+                // Снимаем реальные ссылки на события прямо из DOM
+                List<EventLink> eventLinks = extractEventLinks(page);
+                log.debug("[Winline] Найдено {} ссылок на события в DOM", eventLinks.size());
+
                 String pageText = page.innerText("body");
 
                 if (pageText != null && !pageText.isEmpty()) {
-                    //log.debug("[Winline] Длина текста: {} символов", pageText.length());
-                    allEvents = parsePageText(pageText);
+                    allEvents = parsePageText(pageText, eventLinks);
                 } else {
                     log.warn("[Winline] Пустой текст страницы");
                 }
@@ -94,14 +93,11 @@ public class WinlineParser extends AbstractBookmakerParser {
             browser.close();
         }
 
-        // Дедупликация
         List<RawEvent> deduped = allEvents.stream()
                 .collect(Collectors.collectingAndThen(
                         Collectors.toMap(RawEvent::externalId, e -> e, (a, b) -> a),
                         map -> new ArrayList<>(map.values())
                 ));
-
-        //log.info("[Winline] Итого: {} событий распарсено", deduped.size());
 
         if (!deduped.isEmpty()) {
             eventRepository.saveEvents("WINLINE", deduped);
@@ -119,7 +115,87 @@ public class WinlineParser extends AbstractBookmakerParser {
         return deduped;
     }
 
-    private List<RawEvent> parsePageText(String text) {
+    /**
+     * Достаёт все ссылки на карточки событий вида:
+     * https://winline.ru/stavki/event/16453928 (Line)
+     * https://winline.ru/live/sport/{sport}/{country}/{league}/{eventId} (Live)
+     * Вместе с видимым текстом ссылки (там названия команд).
+     */
+    @SuppressWarnings("unchecked")
+    private List<EventLink> extractEventLinks(Page page) {
+        List<EventLink> result = new ArrayList<>();
+        try {
+            // Ищем любые ссылки, которые заканчиваются на /число (где число - ID события)
+            List<Map<String, String>> raw = (List<Map<String, String>>) page.evaluate("""
+                () => {
+                    const eventIdRegex = /\\/(\\d+)$/;
+                    return Array.from(document.querySelectorAll('a[href*="/stavki/event/"], a[href*="/live/sport/"]'))
+                        .map(a => ({
+                            href: a.href,
+                            text: (a.innerText || '').replace(/\\s+/g, ' ').trim()
+                        }))
+                        .filter(x => x.href && x.text && x.text.length > 3 && eventIdRegex.test(x.href));
+                }
+                """);
+
+            for (Map<String, String> m : raw) {
+                result.add(new EventLink(m.get("href"), m.get("text")));
+            }
+        } catch (Exception e) {
+            log.warn("[Winline] Ошибка извлечения ссылок событий: {}", e.getMessage());
+        }
+        return result;
+    }
+
+    /**
+     * Ищет среди собранных ссылок ту, чей текст содержит оба названия команд.
+     * Если найдено несколько — берём с самым коротким текстом (более точечное совпадение).
+     * Затем вытаскивает ID события из ссылки и формирует каноничную (всегда живую) ссылку.
+     */
+    private String findEventUrl(String team1, String team2, List<EventLink> eventLinks) {
+        String t1 = team1.toLowerCase();
+        String t2 = team2.toLowerCase();
+
+        EventLink best = null;
+        for (EventLink link : eventLinks) {
+            String lower = link.text().toLowerCase();
+            if (lower.contains(t1) && lower.contains(t2)) {
+                if (best == null || link.text().length() < best.text().length()) {
+                    best = link;
+                }
+            }
+        }
+
+        if (best != null) {
+            // Вытаскиваем ID события из ссылки (последнее число в URL)
+            String eventId = extractEventId(best.href());
+            if (eventId != null && !eventId.isEmpty()) {
+                // Возвращаем каноничную ссылку на линию, которая редиректит в Live при необходимости
+                return BASE_URL + "/stavki/event/" + eventId;
+            }
+        }
+
+        // Fallback, если карточку не нашли (редкий случай) — ведём хотя бы на линию сайта
+        return BASE_URL + "/line";
+    }
+
+    /**
+     * Извлекает цифровой ID события из любого формата ссылки Winline.
+     */
+    private String extractEventId(String url) {
+        if (url == null || url.isEmpty()) return null;
+        try {
+            Matcher m = Pattern.compile("/(\\d+)$").matcher(url);
+            if (m.find()) {
+                return m.group(1);
+            }
+        } catch (Exception e) {
+            log.warn("[Winline] Ошибка извлечения ID из URL: {}", e.getMessage());
+        }
+        return null;
+    }
+
+    private List<RawEvent> parsePageText(String text, List<EventLink> eventLinks) {
         List<RawEvent> events = new ArrayList<>();
         Set<String> processed = new HashSet<>();
 
@@ -137,20 +213,15 @@ public class WinlineParser extends AbstractBookmakerParser {
             if (!line2.matches(".*[А-Яа-яA-Za-z]{3,}.*")) continue;
             if (isServiceLine(line1) || isServiceLine(line2)) continue;
 
-            // Собираем ВСЕ коэффициенты из следующих строк (П1, Х, П2)
             List<BigDecimal> odds = new ArrayList<>();
             int lastOddIdx = i + 1;
 
             for (int j = i + 2; j < Math.min(i + 12, lines.length); j++) {
                 String oddLine = lines[j].trim();
 
-                // Пропускаем метки исходов: "1", "X", "2", "П1", "Х", "П2"
                 if (oddLine.matches("[1XxХх2]|П[12]|Да|Нет|Over|Under")) continue;
-
-                // Пропускаем служебные слова
                 if (isServiceLine(oddLine)) continue;
 
-                // Ищем коэффициент
                 Matcher m = Pattern.compile("^(\\d+\\.\\d{2})$").matcher(oddLine);
                 if (m.matches()) {
                     BigDecimal odd = new BigDecimal(m.group(1));
@@ -160,10 +231,8 @@ public class WinlineParser extends AbstractBookmakerParser {
                     }
                 }
 
-                // Если нашли 3 коэффициента — это полный матч 1X2
                 if (odds.size() == 3) break;
 
-                // Если встретили название команды (не коэффициент) — стоп
                 if (oddLine.matches(".*[А-Яа-яA-Za-z]{4,}.*") && !oddLine.matches(".*\\d+\\.\\d{2}.*") && odds.size() >= 2) {
                     break;
                 }
@@ -180,14 +249,12 @@ public class WinlineParser extends AbstractBookmakerParser {
             if (processed.contains(key)) continue;
             processed.add(key);
 
-            // Формируем исходы — теперь 3 исхода если есть 3 коэффициента
             List<RawEvent.RawOutcome> outcomes = new ArrayList<>();
             if (odds.size() >= 3) {
                 outcomes.add(new RawEvent.RawOutcome("П1", odds.get(0)));
                 outcomes.add(new RawEvent.RawOutcome("Х", odds.get(1)));
                 outcomes.add(new RawEvent.RawOutcome("П2", odds.get(2)));
             } else {
-                // Для тенниса/баскетбола — только 2 исхода (без ничьей)
                 outcomes.add(new RawEvent.RawOutcome("П1", odds.get(0)));
                 outcomes.add(new RawEvent.RawOutcome("П2", odds.get(1)));
             }
@@ -195,15 +262,13 @@ public class WinlineParser extends AbstractBookmakerParser {
             List<RawEvent.RawMarket> markets = List.of(
                     new RawEvent.RawMarket("1X2", outcomes));
 
-            String dateKey = LocalDateTime.now().toLocalDate().toString(); // 2026-08-12
+            String dateKey = LocalDateTime.now().toLocalDate().toString();
             String eventId = "w_" + team1.toLowerCase().replaceAll("\\s+", "_")
                     + "_" + team2.toLowerCase().replaceAll("\\s+", "_")
                     + "_" + dateKey;
 
-            // Ссылка ведёт на поиск Winline по названию матча — там сразу виден нужный матч
-            String searchQuery = team1 + " " + team2;
-            String eventUrl = BASE_URL + "/line?search="
-                    + java.net.URLEncoder.encode(searchQuery, java.nio.charset.StandardCharsets.UTF_8);
+            // Настоящая ссылка на карточку события, найденная в DOM и преобразованная в каноничный вид
+            String eventUrl = findEventUrl(team1, team2, eventLinks);
 
             events.add(new RawEvent(
                     eventId, "Sport", "Winline",
@@ -213,7 +278,7 @@ public class WinlineParser extends AbstractBookmakerParser {
                     eventUrl
             ));
 
-            log.debug("[Winline] Найден матч: {} vs {} | {}", team1, team2, odds);
+            log.debug("[Winline] Найден матч: {} vs {} | {} | url={}", team1, team2, odds, eventUrl);
 
             i = lastOddIdx;
         }
@@ -238,7 +303,6 @@ public class WinlineParser extends AbstractBookmakerParser {
     }
 
     private String cleanTeamName(String name) {
-        // Убираем лишнее: время, "Сегодня", "Завтра", цифры
         return name
                 .replaceAll("\\bСегодня\\b", "")
                 .replaceAll("\\bЗавтра\\b", "")
