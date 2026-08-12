@@ -3,8 +3,9 @@ package com.oddscanner.parser.fonbet;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.microsoft.playwright.Browser;
+import com.microsoft.playwright.BrowserType;
 import com.microsoft.playwright.Page;
-import com.microsoft.playwright.options.LoadState;
+import com.microsoft.playwright.Playwright;
 import com.oddscanner.parser.AbstractBookmakerParser;
 import com.oddscanner.parser.RawEvent;
 import com.oddscanner.repository.EventRepository;
@@ -30,7 +31,6 @@ public class FonbetParser extends AbstractBookmakerParser {
 
     private static final String BASE_URL = "https://fon.bet";
 
-    private final Browser browser;
     private final EventRepository eventRepository;
     private final HttpClient httpClient = HttpClient.newBuilder()
             .version(HttpClient.Version.HTTP_1_1)
@@ -43,6 +43,7 @@ public class FonbetParser extends AbstractBookmakerParser {
     private long lastApiBaseUrlFetch = 0;
 
     private static final Map<Integer, String> SPORT_MAPPING = new HashMap<>();
+
     static {
         SPORT_MAPPING.put(1, "Футбол");
         SPORT_MAPPING.put(2, "Хоккей");
@@ -53,9 +54,8 @@ public class FonbetParser extends AbstractBookmakerParser {
         SPORT_MAPPING.put(7, "Киберспорт");
     }
 
-    public FonbetParser(MeterRegistry meterRegistry, Browser browser, EventRepository eventRepository) {
+    public FonbetParser(MeterRegistry meterRegistry, EventRepository eventRepository) {
         super(meterRegistry, eventRepository);
-        this.browser = browser;
         this.eventRepository = eventRepository;
     }
 
@@ -84,7 +84,7 @@ public class FonbetParser extends AbstractBookmakerParser {
         events = parseApiResponse(response);
 
         if (!events.isEmpty()) {
-            log.info("[Fonbet] Привязано коэффициентов к {} событиям",
+            log.debug("[Fonbet] Привязано коэффициентов к {} событиям",
                     events.stream().filter(e -> !e.markets().isEmpty()).count());
 
             eventRepository.saveEvents("FONBET", events);
@@ -95,7 +95,7 @@ public class FonbetParser extends AbstractBookmakerParser {
 
             eventRepository.markInactiveEvents("FONBET", activeExternalIds);
 
-            log.info("[Fonbet] Сохранено {} событий", events.size());
+            log.debug("[Fonbet] Сохранено {} событий", events.size());
         }
 
         return events;
@@ -111,20 +111,20 @@ public class FonbetParser extends AbstractBookmakerParser {
             // Парсим коэффициенты из customFactors
             JsonNode customFactorsNode = root.get("customFactors");
             if (customFactorsNode != null && customFactorsNode.isArray()) {
-                log.info("[Fonbet] Найдено {} событий с коэффициентами", customFactorsNode.size());
+                log.debug("[Fonbet] Найдено {} событий с коэффициентами", customFactorsNode.size());
                 parseCustomFactors(customFactorsNode, marketsByEventId);
             }
 
             JsonNode eventsNode = findEventsNode(root);
-            if (eventsNode != null && eventsNode.isArray() && eventsNode.size() > 0) {
-                log.info("[Fonbet] Найдено {} событий", eventsNode.size());
+            if (eventsNode != null && eventsNode.isArray() && !eventsNode.isEmpty()) {
+                log.debug("[Fonbet] Найдено {} событий", eventsNode.size());
             }
 
             if (!leagueCacheLoaded) {
                 Map<Integer, String> freshMapping = buildLeagueMapping(root);
                 dynamicLeagueCache.putAll(freshMapping);
                 leagueCacheLoaded = true;
-                log.info("[Fonbet] Загружено {} лиг", dynamicLeagueCache.size());
+                log.debug("[Fonbet] Загружено {} лиг", dynamicLeagueCache.size());
             }
 
             if (eventsNode == null || !eventsNode.isArray()) {
@@ -163,7 +163,7 @@ public class FonbetParser extends AbstractBookmakerParser {
                 }
             }
 
-            log.info("[Fonbet] Спарсено {} событий, {} с коэффициентами",
+            log.debug("[Fonbet] Спарсено {} событий, {} с коэффициентами",
                     events.size(),
                     events.stream().filter(e -> !e.markets().isEmpty()).count());
 
@@ -236,7 +236,7 @@ public class FonbetParser extends AbstractBookmakerParser {
             Integer p = getIntField(factorNode, "p");
             if (p != null && p != 0) {
                 double value = p / 100.0;
-                pt = value == Math.floor(value) ? String.valueOf((int)value) : String.valueOf(value);
+                pt = value == Math.floor(value) ? String.valueOf((int) value) : String.valueOf(value);
             }
         }
 
@@ -260,15 +260,16 @@ public class FonbetParser extends AbstractBookmakerParser {
             return "Ф2";
         }
 
-        switch (factorId) {
-            case 921: return "П1";
-            case 922: return "Ничья";
-            case 923: return "П2";
-            case 924: return "1X";
-            case 925: return "X2";
-            case 1571: return "12";
-            default: return "Исход_" + factorId;
-        }
+        return switch (factorId) {
+            case 921 -> "П1";
+            case 922 -> "Ничья";
+            case 923 -> "П2";
+            case 924 -> "1X";
+            case 925 -> "X2";
+            case 1571 -> "12";
+            default ->
+                 "Исход_" + factorId;
+        };
     }
 
     private boolean isTotalFactor(Integer id) {
@@ -306,12 +307,12 @@ public class FonbetParser extends AbstractBookmakerParser {
 
         for (String path : possiblePaths) {
             JsonNode node = root.get(path);
-            if (node != null && node.isArray() && node.size() > 0) {
+            if (node != null && node.isArray() && !node.isEmpty()) {
                 return node;
             }
         }
 
-        if (root.isArray() && root.size() > 0) {
+        if (root.isArray() && !root.isEmpty()) {
             return root;
         }
 
@@ -343,7 +344,7 @@ public class FonbetParser extends AbstractBookmakerParser {
         String sportAlias = getSportAlias(eventNode, root);
 
         String eventUrl = null;
-        if (sportId != null && sportAlias != null) {
+        if (sportId != null) {
             // Формат: /sports/{sportAlias}/{sportId}/{eventId}
             eventUrl = BASE_URL + "/sports/" + sportAlias + "/" + sportId + "/" + eventId;
         }
@@ -359,34 +360,6 @@ public class FonbetParser extends AbstractBookmakerParser {
                 eventUrl
         );
     }
-
-    // Новый метод для поиска tournamentId
-    private Integer findTournamentId(Integer sportId, JsonNode root) {
-        if (sportId == null) return null;
-
-        JsonNode sports = root.get("sports");
-        if (sports != null && sports.isArray()) {
-            for (JsonNode sport : sports) {
-                Integer id = getIntField(sport, "id");
-                if (id != null && id.equals(sportId)) {
-                    // Проверяем есть ли tournamentId в этом элементе
-                    Integer tournamentId = getIntField(sport, "tournamentId", "leagueId", "categoryId");
-                    if (tournamentId != null) {
-                        return tournamentId;
-                    }
-
-                    // Или ищем в parentId
-                    Integer parentId = getIntField(sport, "parentId");
-                    if (parentId != null) {
-                        return parentId;
-                    }
-                }
-            }
-        }
-
-        return null;
-    }
-
 
     private String getSportAlias(JsonNode eventNode, JsonNode root) {
         Integer sportId = getIntField(eventNode, "sportId");
@@ -519,7 +492,7 @@ public class FonbetParser extends AbstractBookmakerParser {
                 lower.contains("esports") || lower.contains("h2h liga")) {
             return "Киберспорт (Футбол)";
         }
-        if (lower.contains("nhl") || lower.contains("nba 2k") ||
+        if (lower.contains("nba 2k") ||
                 lower.contains("nba2k") || lower.contains("шорт-хоккей")) {
             return "Киберспорт";
         }
@@ -626,12 +599,20 @@ public class FonbetParser extends AbstractBookmakerParser {
         return leagueMap;
     }
 
+    private static final String[] KNOWN_API_URLS = {
+            "https://line-lb54-w.bk6bba-resources.com"
+    };
+
     private String discoverApiBaseUrl() {
-        if (cachedApiBaseUrl != null && System.currentTimeMillis() - lastApiBaseUrlFetch < 300000) {
+        if (cachedApiBaseUrl != null && System.currentTimeMillis() - lastApiBaseUrlFetch < 300_000) {
             return cachedApiBaseUrl;
         }
 
-        try {
+        try (Playwright playwright = Playwright.create()) {
+            Browser browser = playwright.chromium().launch(new BrowserType.LaunchOptions()
+                    .setHeadless(true)
+                    .setArgs(List.of("--disable-blink-features=AutomationControlled", "--no-sandbox")));
+
             Page page = browser.newPage();
             page.setExtraHTTPHeaders(Map.of(
                     "Accept-Language", "ru-RU,ru;q=0.9",
@@ -639,8 +620,9 @@ public class FonbetParser extends AbstractBookmakerParser {
             ));
 
             List<String> apiUrls = new ArrayList<>();
-            page.onRequest(request -> {
-                String url = request.url();
+
+            page.onResponse(response -> {
+                String url = response.url();
                 if (url.contains("/ma/events/list") && url.contains("bk6bba-resources")) {
                     try {
                         java.net.URI uri = new java.net.URI(url);
@@ -648,37 +630,61 @@ public class FonbetParser extends AbstractBookmakerParser {
                         if (!apiUrls.contains(baseUrl)) {
                             apiUrls.add(baseUrl);
                         }
-                    } catch (Exception e) {
-                        log.error("[Fonbet] Ошибка парсинга URL: {}", e.getMessage());
-                    }
+                    } catch (Exception ignored) {}
                 }
             });
 
-            page.navigate(BASE_URL);
-            page.waitForLoadState(LoadState.NETWORKIDLE);
-            page.waitForTimeout(5000);
+            // КЛЮЧЕВОЕ: используем route.abort() чтобы не ждать загрузку страницы
+            // Просто открываем и сразу закрываем через 10 сек
+            page.navigate(BASE_URL, new Page.NavigateOptions()
+                    .setTimeout(10_000)
+                    .setWaitUntil(com.microsoft.playwright.options.WaitUntilState.DOMCONTENTLOADED));
 
-            page.reload();
-            page.waitForLoadState(LoadState.NETWORKIDLE);
-            page.waitForTimeout(5000);
+            // Если navigate не выбросил exception — ждём ещё 5 сек для API-запросов
+            page.waitForTimeout(5_000);
+
+            page.close();
+            browser.close();
 
             if (!apiUrls.isEmpty()) {
-                cachedApiBaseUrl = apiUrls.get(0);
+                cachedApiBaseUrl = apiUrls.getFirst();
                 lastApiBaseUrlFetch = System.currentTimeMillis();
-                log.info("[Fonbet] API базовый URL: {}", cachedApiBaseUrl);
-                page.close();
+                log.debug("[Fonbet] API базовый URL: {}", cachedApiBaseUrl);
                 return cachedApiBaseUrl;
             }
 
-            page.close();
-
         } catch (Exception e) {
-            log.error("[Fonbet] Ошибка при обнаружении API URL: {}", e.getMessage());
+            // Timeout от navigate — это НОРМАЛЬНО, API URL мог уже быть перехвачен
+            log.warn("[Fonbet] Navigate timeout (это нормально): {}", e.getMessage());
         }
 
+        // Если Playwright не сработал — fallback на известные URL
+        log.warn("[Fonbet] Playwright не нашёл URL, пробуем известные...");
+        for (String url : KNOWN_API_URLS) {
+            try {
+                String testUrl = url + "/ma/events/listBase?lang=ru&scopeMarket=1600&version=" + System.currentTimeMillis();
+                HttpRequest request = HttpRequest.newBuilder()
+                        .uri(URI.create(testUrl))
+                        .header("Accept", "*/*")
+                        .header("User-Agent", "Mozilla/5.0")
+                        .timeout(java.time.Duration.ofSeconds(10))
+                        .GET()
+                        .build();
+
+                HttpResponse<byte[]> response = httpClient.send(request, HttpResponse.BodyHandlers.ofByteArray());
+
+                if (response.statusCode() == 200 && response.body().length > 100) {
+                    cachedApiBaseUrl = url;
+                    lastApiBaseUrlFetch = System.currentTimeMillis();
+                    log.debug("[Fonbet] API базовый URL (fallback): {}", url);
+                    return url;
+                }
+            } catch (Exception ignored) {}
+        }
+
+        log.error("[Fonbet] Не удалось определить API URL");
         return null;
     }
-
     private String fetchApiData(String url) throws IOException, InterruptedException {
         HttpRequest request = HttpRequest.newBuilder()
                 .uri(URI.create(url))
@@ -687,6 +693,7 @@ public class FonbetParser extends AbstractBookmakerParser {
                 .header("Origin", BASE_URL)
                 .header("Referer", BASE_URL + "/")
                 .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+                .timeout(java.time.Duration.ofSeconds(30))
                 .GET()
                 .build();
 

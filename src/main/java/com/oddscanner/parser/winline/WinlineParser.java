@@ -1,7 +1,5 @@
 package com.oddscanner.parser.winline;
 
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import com.microsoft.playwright.*;
 import com.microsoft.playwright.options.WaitUntilState;
 import com.oddscanner.parser.AbstractBookmakerParser;
@@ -13,7 +11,10 @@ import org.springframework.stereotype.Component;
 
 import java.math.BigDecimal;
 import java.time.LocalDateTime;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
@@ -24,21 +25,8 @@ public class WinlineParser extends AbstractBookmakerParser {
 
     private static final String BASE_URL = "https://winline.ru";
 
-    // Паттерн для поиска матча в тексте Winline:
-    // "Команда1 \n Команда2 \n 1.85 \n 3.70 \n 4.60"
-    private static final Pattern MATCH_PATTERN = Pattern.compile(
-            "([А-Яа-яA-Za-z][А-Яа-яA-Za-z0-9\\s\\.]{2,30}?)\\s*\\n\\s*" +
-                    "([А-Яа-яA-Za-z][А-Яа-яA-Za-z0-9\\s\\.]{2,30}?)\\s*\\n\\s*" +
-                    "(?:[\\d]+\\s*\\n\\s*)?" +  // опциональный счёт или время
-                    "(\\d+\\.\\d{2})\\s*\\n\\s*" +
-                    "(?:(?:X|x|Х|х)\\s*\\n\\s*)?(\\d+\\.\\d{2})(?:\\s*\\n\\s*(?:(?:2|П2)\\s*\\n\\s*)?(\\d+\\.\\d{2}))?"
-    );
-
-    private final ObjectMapper objectMapper;
-
     public WinlineParser(MeterRegistry meterRegistry, EventRepository eventRepository) {
         super(meterRegistry, eventRepository);
-        this.objectMapper = new ObjectMapper();
     }
 
     @Override
@@ -69,33 +57,32 @@ public class WinlineParser extends AbstractBookmakerParser {
 
                 // Stealth: убираем webdriver-флаг
                 page.addInitScript("""
-                    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-                    Object.defineProperty(navigator, 'languages', { get: () => ['ru-RU', 'ru', 'en'] });
-                    Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-                    window.chrome = { runtime: {} };
-                """);
+                            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                            Object.defineProperty(navigator, 'languages', { get: () => ['ru-RU', 'ru', 'en'] });
+                            Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+                            window.chrome = { runtime: {} };
+                        """);
 
-                log.debug("[Winline] Открываю главную страницу...");
+                //log.debug("[Winline] Открываю главную страницу...");
                 page.navigate(BASE_URL, new Page.NavigateOptions()
-                        .setTimeout(60_000)
-                        .setWaitUntil(WaitUntilState.NETWORKIDLE));
+                        .setTimeout(90_000)  // было 60_000
+                        .setWaitUntil(WaitUntilState.DOMCONTENTLOADED));  // было NETWORKIDLE
 
-                // Ждём появления коэффициентов
+                // Ждём появления коэффициентов — увеличим таймаут
                 try {
                     page.waitForSelector("text=/\\d+\\.\\d{2}/", new Page.WaitForSelectorOptions()
-                            .setTimeout(15_000));
-                    log.debug("[Winline] Коэффициенты найдены");
+                            .setTimeout(30_000));  // было 15_000
                 } catch (Exception e) {
-                    log.debug("[Winline] Не удалось дождаться коэффициентов: {}", e.getMessage());
+                    log.warn("[Winline] Не удалось дождаться коэффициентов: {}", e.getMessage());
                 }
 
-                page.waitForTimeout(5000);
+                page.waitForTimeout(7000);  // было 5000 — дадим странице дорендериться
 
                 // Извлекаем текст страницы
                 String pageText = page.innerText("body");
 
                 if (pageText != null && !pageText.isEmpty()) {
-                    log.debug("[Winline] Длина текста: {} символов", pageText.length());
+                    //log.debug("[Winline] Длина текста: {} символов", pageText.length());
                     allEvents = parsePageText(pageText);
                 } else {
                     log.warn("[Winline] Пустой текст страницы");
@@ -114,7 +101,7 @@ public class WinlineParser extends AbstractBookmakerParser {
                         map -> new ArrayList<>(map.values())
                 ));
 
-        log.info("[Winline] Итого: {} событий распарсено", deduped.size());
+        //log.info("[Winline] Итого: {} событий распарсено", deduped.size());
 
         if (!deduped.isEmpty()) {
             eventRepository.saveEvents("WINLINE", deduped);
@@ -124,7 +111,7 @@ public class WinlineParser extends AbstractBookmakerParser {
                     .collect(Collectors.toSet());
             eventRepository.markInactiveEvents("WINLINE", activeExternalIds);
 
-            log.info("[Winline] Сохранено {} событий", deduped.size());
+            log.debug("[Winline] Сохранено {} событий", deduped.size());
         } else {
             log.warn("[Winline] Не найдено событий");
         }
@@ -199,7 +186,7 @@ public class WinlineParser extends AbstractBookmakerParser {
                 outcomes.add(new RawEvent.RawOutcome("П1", odds.get(0)));
                 outcomes.add(new RawEvent.RawOutcome("Х", odds.get(1)));
                 outcomes.add(new RawEvent.RawOutcome("П2", odds.get(2)));
-            } else if (odds.size() == 2) {
+            } else {
                 // Для тенниса/баскетбола — только 2 исхода (без ничьей)
                 outcomes.add(new RawEvent.RawOutcome("П1", odds.get(0)));
                 outcomes.add(new RawEvent.RawOutcome("П2", odds.get(1)));
@@ -208,14 +195,22 @@ public class WinlineParser extends AbstractBookmakerParser {
             List<RawEvent.RawMarket> markets = List.of(
                     new RawEvent.RawMarket("1X2", outcomes));
 
-            String eventId = UUID.randomUUID().toString();
+            String dateKey = LocalDateTime.now().toLocalDate().toString(); // 2026-08-12
+            String eventId = "w_" + team1.toLowerCase().replaceAll("\\s+", "_")
+                    + "_" + team2.toLowerCase().replaceAll("\\s+", "_")
+                    + "_" + dateKey;
+
+            // Ссылка ведёт на поиск Winline по названию матча — там сразу виден нужный матч
+            String searchQuery = team1 + " " + team2;
+            String eventUrl = BASE_URL + "/line?search="
+                    + java.net.URLEncoder.encode(searchQuery, java.nio.charset.StandardCharsets.UTF_8);
 
             events.add(new RawEvent(
                     eventId, "Sport", "Winline",
                     team1, team2,
                     LocalDateTime.now().plusHours(2),
                     markets,
-                    BASE_URL + "/line/" + eventId
+                    eventUrl
             ));
 
             log.debug("[Winline] Найден матч: {} vs {} | {}", team1, team2, odds);
@@ -223,7 +218,7 @@ public class WinlineParser extends AbstractBookmakerParser {
             i = lastOddIdx;
         }
 
-        log.info("[Winline] Распарсено {} событий из текста", events.size());
+        log.debug("[Winline] Распарсено {} событий из текста", events.size());
         return events;
     }
 

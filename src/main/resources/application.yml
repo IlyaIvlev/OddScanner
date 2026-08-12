@@ -31,15 +31,7 @@ spring:
 # Парсеры
 parser:
   thread-pool-size: 5
-  bet365:
-    enabled: true
-    interval: 60000  # 60 секунд
-  fonbet:
-    enabled: true
-    interval: 60000
-  marathon:
-    enabled: true
-    interval: 60000
+  scan-interval: 45000
 
 # Actuator / Мониторинг
 management:
@@ -58,11 +50,12 @@ management:
 logging:
   level:
     root: INFO
-    com.oddscanner: DEBUG
-    liquibase: INFO
-    org.jooq: INFO
-    com.zaxxer.hikari: INFO
-    org.springframework.boot: INFO
+    com.oddscanner: INFO
+    com.oddscanner.config.ScanOrchestrator: INFO
+    com.oddscanner.repository.EventRepository: WARN
+    com.oddscanner.parser.winline.WinlineParser: DEBUG
+    com.oddscanner.parser.fonbet.FonbetParser: DEBUG
+    com.oddscanner.repository: DEBUG
 
 # Swagger / OpenAPI (если используешь)
 springdoc:
