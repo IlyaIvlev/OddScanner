@@ -26,39 +26,22 @@ import java.time.format.DateTimeParseException;
 import java.util.*;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.stream.Collectors;
 
 @Slf4j
 @Component
 public class MarathonParser extends AbstractBookmakerParser {
 
-    private static final String BASE_URL =
-            "https://www.marathonbet.ru";
+    private static final String BASE_URL = "https://www.marathonbet.ru";
+    private static final String FOOTBALL_BASE_URL = BASE_URL + "/su/popular/Football+-+11";
+    private static final int MAX_PAGES = 10;
 
-    /**
-     * Одна основная футбольная страница.
-     * Не ходим отдельно в каждый матч.
-     * На этой странице уже находятся события и рынки.
-     */
-    private static final String FOOTBALL_URL =
-            BASE_URL + "/su/popular/Football+-+11";
+    private static final DateTimeFormatter TIME_FORMAT = DateTimeFormatter.ofPattern("HH:mm");
+    private static final Pattern TIME_PATTERN = Pattern.compile("\\b(\\d{1,2}:\\d{2})\\b");
+    private static final Pattern NUMBER_PATTERN = Pattern.compile("^\\d+(?:[.,]\\d+)?$");
 
-    private static final DateTimeFormatter TIME_FORMAT =
-            DateTimeFormatter.ofPattern("HH:mm");
-
-    private static final Pattern TIME_PATTERN =
-            Pattern.compile("\\b(\\d{1,2}:\\d{2})\\b");
-
-    private static final Pattern NUMBER_PATTERN =
-            Pattern.compile("^\\d+(?:[.,]\\d+)?$");
-
-    private final EventRepository eventRepository;
-
-    public MarathonParser(
-            MeterRegistry meterRegistry,
-            EventRepository eventRepository
-    ) {
+    public MarathonParser(MeterRegistry meterRegistry, EventRepository eventRepository) {
         super(meterRegistry, eventRepository);
-        this.eventRepository = eventRepository;
     }
 
     @Override
@@ -68,1669 +51,688 @@ public class MarathonParser extends AbstractBookmakerParser {
 
     @Override
     public List<RawEvent> doParse() throws Exception {
-
         log.info("[Marathon] Запуск парсера");
 
-        String html = loadPage();
+        List<RawEvent> allEvents = new ArrayList<>();
+        Set<String> seenExternalIds = new HashSet<>();
 
-        if (html == null || html.isBlank()) {
-            log.warn("[Marathon] Получен пустой HTML");
+        try (Playwright playwright = Playwright.create();
+             Browser browser = playwright.chromium().launch(
+                     new BrowserType.LaunchOptions()
+                             .setHeadless(true)
+                             .setArgs(List.of(
+                                     "--disable-blink-features=AutomationControlled",
+                                     "--no-sandbox",
+                                     "--disable-dev-shm-usage"
+                             ))
+             );
+             BrowserContext context = browser.newContext(
+                     new Browser.NewContextOptions()
+                             .setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
+                                     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36")
+                             .setLocale("ru-RU")
+                             .setTimezoneId("Europe/Moscow")
+                             .setViewportSize(1920, 1080)
+                             .setExtraHTTPHeaders(Map.of("Accept-Language", "ru-RU,ru;q=0.9,en;q=0.8"))
+             )) {
+
+            Page page = context.newPage();
+            page.addInitScript("""
+                    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                    Object.defineProperty(navigator, 'languages', { get: () => ['ru-RU', 'ru', 'en'] });
+                    window.chrome = { runtime: {} };
+                    """);
+
+            for (int pageNum = 1; pageNum <= MAX_PAGES; pageNum++) {
+                String url = pageNum == 1
+                        ? FOOTBALL_BASE_URL
+                        : FOOTBALL_BASE_URL + "?page=" + pageNum;
+
+                log.info("[Marathon] Загрузка страницы {}: {}", pageNum, url);
+
+                String html = loadPage(page, url);
+                if (html == null || html.isBlank()) {
+                    log.warn("[Marathon] Пустой HTML на странице {}, останавливаемся", pageNum);
+                    break;
+                }
+
+                log.info("[Marathon] Страница {}: {} KB", pageNum, html.length() / 1024);
+
+                List<RawEvent> pageEvents = parseHtml(html);
+                if (pageEvents.isEmpty()) {
+                    log.info("[Marathon] На странице {} нет событий, останавливаемся", pageNum);
+                    break;
+                }
+
+                int added = 0;
+                for (RawEvent event : pageEvents) {
+                    if (seenExternalIds.add(event.externalId())) {
+                        allEvents.add(event);
+                        added++;
+                    }
+                }
+
+                log.info("[Marathon] Страница {}: {} новых событий (всего: {})", pageNum, added, allEvents.size());
+
+                if (added == 0) {
+                    log.info("[Marathon] Все события на странице {} дубликаты, останавливаемся", pageNum);
+                    break;
+                }
+            }
+
+            page.close();
+        } catch (Exception e) {
+            log.error("[Marathon] Ошибка загрузки страниц", e);
+        }
+
+        if (allEvents.isEmpty()) {
+            log.warn("[Marathon] События не найдены");
             return Collections.emptyList();
         }
 
-        log.info(
-                "[Marathon] HTML получен: {} KB",
-                html.length() / 1024
-        );
+        eventRepository.saveEvents("MARATHON", allEvents);
 
-        List<RawEvent> events = parseHtml(html);
+        Set<String> activeExternalIds = allEvents.stream()
+                .map(RawEvent::externalId)
+                .collect(Collectors.toSet());
 
-        if (events.isEmpty()) {
-            log.warn("[Marathon] События не найдены");
-            return events;
-        }
+        eventRepository.markInactiveEvents("MARATHON", activeExternalIds);
 
-        eventRepository.saveEvents(
-                "MARATHON",
-                events
-        );
-
-        Set<String> activeExternalIds =
-                events.stream()
-                        .map(RawEvent::externalId)
-                        .collect(java.util.stream.Collectors.toSet());
-
-        eventRepository.markInactiveEvents(
-                "MARATHON",
-                activeExternalIds
-        );
-
-        log.info(
-                "[Marathon] СОХРАНЕНО {} событий",
-                events.size()
-        );
-
-        return events;
+        log.info("[Marathon] СОХРАНЕНО {} событий", allEvents.size());
+        return allEvents;
     }
 
-    /**
-     * Загружаем только основную страницу.
-     */
-    private String loadPage() {
+    private String loadPage(Page page, String url) {
+        try {
+            page.navigate(url, new Page.NavigateOptions()
+                    .setTimeout(30_000)
+                    .setWaitUntil(WaitUntilState.DOMCONTENTLOADED));
 
-        try (Playwright playwright = Playwright.create()) {
+            log.info("[Marathon] Страница загружена. URL={}", page.url());
 
-            try (Browser browser = playwright.chromium().launch(
-                    new BrowserType.LaunchOptions()
-                            .setHeadless(true)
-                            .setArgs(List.of(
-                                    "--disable-blink-features=AutomationControlled",
-                                    "--no-sandbox",
-                                    "--disable-dev-shm-usage"
-                            ))
-            ); BrowserContext context =
-                         browser.newContext(
-                                 new Browser.NewContextOptions()
-                                         .setUserAgent(
-                                                 "Mozilla/5.0 " +
-                                                         "(Windows NT 10.0; Win64; x64) " +
-                                                         "AppleWebKit/537.36 " +
-                                                         "(KHTML, like Gecko) " +
-                                                         "Chrome/125.0.0.0 Safari/537.36"
-                                         )
-                                         .setLocale("ru-RU")
-                                         .setTimezoneId("Europe/Moscow")
-                                         .setViewportSize(1920, 1080)
-                                         .setExtraHTTPHeaders(
-                                                 Map.of(
-                                                         "Accept-Language",
-                                                         "ru-RU,ru;q=0.9,en;q=0.8"
-                                                 )
-                                         )
-                         )) {
+            page.waitForTimeout(5000);
 
-                Page page = context.newPage();
-
-                page.addInitScript("""
-                        Object.defineProperty(
-                            navigator,
-                            'webdriver',
-                            { get: () => undefined }
-                        );
-                        
-                        Object.defineProperty(
-                            navigator,
-                            'languages',
-                            { get: () => ['ru-RU', 'ru', 'en'] }
-                        );
-                        
-                        window.chrome = {
-                            runtime: {}
-                        };
-                        """);
-
-                log.info(
-                        "[Marathon] Открываем {}",
-                        FOOTBALL_URL
-                );
-
-                page.navigate(
-                        FOOTBALL_URL,
-                        new Page.NavigateOptions()
-                                .setTimeout(30_000)
-                                .setWaitUntil(
-                                        WaitUntilState.DOMCONTENTLOADED
-                                )
-                );
-
-                log.info(
-                        "[Marathon] Страница загружена. URL={}",
-                        page.url()
-                );
-
-                /*
-                 * Ждём появления динамического DOM.
-                 */
-                page.waitForTimeout(5000);
-
-                /*
-                 * Прокручиваем страницу несколько раз.
-                 *
-                 * Не открываем страницы отдельных матчей.
-                 */
-                for (int i = 0; i < 12; i++) {
-
-                    page.mouse().wheel(0, 1800);
-
-                    page.waitForTimeout(300);
-                }
-
-                page.waitForTimeout(1000);
-
-                String html = page.content();
-
-                log.info(
-                        "[Marathon] Получен DOM страницы: {} KB",
-                        html.length() / 1024
-                );
-
-                page.close();
-
-                return html;
-
+            for (int i = 0; i < 12; i++) {
+                page.mouse().wheel(0, 1800);
+                page.waitForTimeout(300);
             }
 
+            page.waitForTimeout(1000);
+            return page.content();
+
         } catch (Exception e) {
-
-            log.error(
-                    "[Marathon] Ошибка загрузки страницы",
-                    e
-            );
-
+            log.error("[Marathon] Ошибка загрузки страницы: {}", url, e);
             return null;
         }
     }
 
-    /**
-     * Разбираем основную страницу.
-     */
+    // ======================== HTML PARSING ========================
+
     private List<RawEvent> parseHtml(String html) {
+        List<RawEvent> result = new ArrayList<>();
+        Document document = Jsoup.parse(html);
 
-        List<RawEvent> result =
-                new ArrayList<>();
+        Elements eventBlocks = document.select("[data-event-eventid]");
+        log.info("[Marathon] Найдено элементов с data-event-eventid: {}", eventBlocks.size());
 
-        Document document =
-                Jsoup.parse(html);
-
-        /*
-         * Основной селектор.
-         */
-        Elements eventBlocks =
-                document.select(
-                        "[data-event-eventid]"
-                );
-
-        log.info(
-                "[Marathon] Найдено элементов с data-event-eventid: {}",
-                eventBlocks.size()
-        );
-
-        /*
-         * Если вдруг основной селектор изменился,
-         * пробуем более общий вариант.
-         */
         if (eventBlocks.isEmpty()) {
-
-            eventBlocks =
-                    document.select(
-                            ".coupon-row"
-                    );
-
-            log.info(
-                    "[Marathon] Резервный поиск coupon-row: {}",
-                    eventBlocks.size()
-            );
+            eventBlocks = document.select(".coupon-row");
+            log.info("[Marathon] Резервный поиск coupon-row: {}", eventBlocks.size());
         }
 
-        Set<String> processedEventIds =
-                new HashSet<>();
-
+        Set<String> processedEventIds = new HashSet<>();
         int skipped = 0;
 
         for (Element eventBlock : eventBlocks) {
-
             try {
-
-                String eventId =
-                        firstNonBlank(
-                                eventBlock.attr("data-event-eventid"),
-                                eventBlock.attr("data-event-id"),
-                                eventBlock.attr("data-id")
-                        );
-
+                String eventId = firstNonBlank(
+                        eventBlock.attr("data-event-eventid"),
+                        eventBlock.attr("data-event-id"),
+                        eventBlock.attr("data-id"));
                 eventId = clean(eventId);
 
-                /*
-                 * Если ID нет — всё равно пытаемся
-                 * разобрать блок.
-                 */
                 if (eventId == null) {
-
-                    eventId =
-                            buildFallbackEventId(
-                                    eventBlock
-                            );
+                    eventId = buildFallbackEventId(eventBlock);
                 }
+                if (eventId == null) { skipped++; continue; }
+                if (!processedEventIds.add(eventId)) continue;
 
-                if (eventId == null) {
-                    skipped++;
-                    continue;
-                }
+                String live = firstNonBlank(
+                        eventBlock.attr("data-live"),
+                        eventBlock.attr("data-event-live"));
+                if ("true".equalsIgnoreCase(clean(live))) continue;
 
-                if (!processedEventIds.add(eventId)) {
-                    continue;
-                }
-
-                /*
-                 * Live пока не берём.
-                 */
-                String live =
-                        firstNonBlank(
-                                eventBlock.attr("data-live"),
-                                eventBlock.attr("data-event-live")
-                        );
-
-                if ("true".equalsIgnoreCase(
-                        clean(live)
-                )) {
-                    continue;
-                }
-
-                RawEvent event =
-                        parseEvent(
-                                eventBlock,
-                                eventId
-                        );
-
-                if (event == null) {
-                    skipped++;
-                    continue;
-                }
+                RawEvent event = parseEvent(eventBlock, eventId);
+                if (event == null) { skipped++; continue; }
 
                 result.add(event);
-
-                log.info(
-                        "[Marathon] EVENT: {} - {} | {} | рынков={}",
-                        event.team1(),
-                        event.team2(),
-                        event.startsAt(),
-                        event.markets().size()
-                );
+                log.info("[Marathon] EVENT: {} - {} | {} | рынков={}",
+                        event.team1(), event.team2(), event.startsAt(), event.markets().size());
 
             } catch (Exception e) {
-
                 skipped++;
-
-                log.warn(
-                        "[Marathon] Ошибка обработки блока: {}",
-                        e.getMessage()
-                );
+                log.warn("[Marathon] Ошибка обработки блока: {}", e.getMessage());
             }
         }
 
-        log.info(
-                "[Marathon] Всего распарсено событий: {}",
-                result.size()
-        );
-
-        log.info(
-                "[Marathon] Пропущено блоков: {}",
-                skipped
-        );
-
+        log.info("[Marathon] Распарсено: {}, пропущено: {}", result.size(), skipped);
         return result;
     }
 
-    /**
-     * Разбираем одно событие.
-     */
-    private RawEvent parseEvent(
-            Element eventBlock,
-            String eventId
-    ) {
-
-        /*
-         * Сначала ищем команды.
-         */
-        String[] teams =
-                extractTeams(eventBlock);
-
+    private RawEvent parseEvent(Element eventBlock, String eventId) {
+        String[] teams = extractTeams(eventBlock);
         if (teams == null) {
-
-            log.debug(
-                    "[Marathon] Не удалось определить команды. id={}",
-                    eventId
-            );
-
+            log.debug("[Marathon] Не удалось определить команды. id={}", eventId);
             return null;
         }
 
-        String team1 = teams[0];
-        String team2 = teams[1];
-
-        /*
-         * Время.
-         */
-        LocalDateTime startsAt =
-                extractStartTime(eventBlock);
-
-        /*
-         * Лига.
-         */
-        String league =
-                extractLeague(eventBlock);
-
-        /*
-         * Все рынки непосредственно из блока.
-         */
-        List<RawEvent.RawMarket> markets =
-                extractMarkets(eventBlock);
+        LocalDateTime startsAt = extractStartTime(eventBlock);
+        String league = extractLeague(eventBlock);
+        List<RawEvent.RawMarket> markets = extractMarkets(eventBlock);
 
         if (markets.isEmpty()) {
-
-            log.debug(
-                    "[Marathon] {} - {}: рынков не найдено. id={}",
-                    team1,
-                    team2,
-                    eventId
-            );
-
+            log.debug("[Marathon] {} - {}: рынков не найдено. id={}", teams[0], teams[1], eventId);
             return null;
         }
 
-        String eventUrl =
-                extractEventUrl(eventBlock);
+        String eventUrl = extractEventUrl(eventBlock);
+        String externalId = "marathon_" + eventId;
 
-        String externalId =
-                "marathon_" + eventId;
-
-        return new RawEvent(
-                externalId,
-                "Футбол",
-                league,
-                team1,
-                team2,
-                startsAt,
-                markets,
-                eventUrl == null
-                        ? ""
-                        : eventUrl
-        );
+        return new RawEvent(externalId, "Футбол", league,
+                teams[0], teams[1], startsAt, markets,
+                eventUrl == null ? "" : eventUrl);
     }
 
-    /**
-     * Извлечение команд.
-     * Здесь специально несколько вариантов,
-     * потому что структура Marathon может отличаться
-     * между блоками.
-     */
-    private String[] extractTeams(
-            Element eventBlock
-    ) {
+    // ======================== TEAMS ========================
 
-        /*
-         * Вариант 1.
-         */
-        Elements members =
-                eventBlock.select(
-                        ".member-name .member-link"
-                );
+    private String[] extractTeams(Element eventBlock) {
+        Elements members = eventBlock.select(".member-name .member-link");
+        String[] result = extractFirstTwoTexts(members);
+        if (result != null) return result;
 
-        String[] result =
-                extractFirstTwoTexts(members);
+        members = eventBlock.select(".member-name");
+        result = extractFirstTwoTexts(members);
+        if (result != null) return result;
 
-        if (result != null) {
-            return result;
-        }
+        members = eventBlock.select("[data-member-name]");
+        result = extractFirstTwoAttributes(members);
+        if (result != null) return result;
 
-        /*
-         * Вариант 2.
-         */
-        members =
-                eventBlock.select(
-                        ".member-name"
-                );
+        members = eventBlock.select(".member-link");
+        result = extractFirstTwoTexts(members);
+        if (result != null) return result;
 
-        result =
-                extractFirstTwoTexts(members);
+        String eventName = firstNonBlank(
+                eventBlock.attr("data-event-name"),
+                eventBlock.attr("data-event-title"),
+                eventBlock.attr("data-name"));
+        result = splitTeams(clean(eventName));
+        if (result != null) return result;
 
-        if (result != null) {
-            return result;
-        }
-
-        /*
-         * Вариант 3.
-         */
-        members =
-                eventBlock.select(
-                        "[data-member-name]"
-                );
-
-        result =
-                extractFirstTwoAttributes(
-                        members
-                );
-
-        if (result != null) {
-            return result;
-        }
-
-        /*
-         * Вариант 4.
-         */
-        members =
-                eventBlock.select(
-                        ".member-link"
-                );
-
-        result =
-                extractFirstTwoTexts(members);
-
-        if (result != null) {
-            return result;
-        }
-
-        /*
-         * Вариант 5 — data-event-name.
-         */
-        String eventName =
-                firstNonBlank(
-                        eventBlock.attr("data-event-name"),
-                        eventBlock.attr("data-event-title"),
-                        eventBlock.attr("data-name")
-                );
-
-        eventName = clean(eventName);
-
-        result =
-                splitTeams(eventName);
-
-        if (result != null) {
-            return result;
-        }
-
-        /*
-         * Вариант 6 — берём текст блока и
-         * ищем конструкцию:
-         *
-         * Команда 1 - Команда 2
-         */
-        String text =
-                clean(eventBlock.text());
-
-        return splitTeams(text);
+        return splitTeams(clean(eventBlock.text()));
     }
 
-    private String[] extractFirstTwoTexts(
-            Elements elements
-    ) {
-
-        List<String> values =
-                new ArrayList<>();
-
-        for (Element element : elements) {
-
-            String value =
-                    clean(element.text());
-
-            if (value == null) {
-                continue;
-            }
-
-            /*
-             * Не считаем числовые элементы командами.
-             */
-            if (parseOdds(value) != null) {
-                continue;
-            }
-
-            if (!values.contains(value)) {
-                values.add(value);
-            }
-
-            if (values.size() == 2) {
-                break;
-            }
+    private String[] extractFirstTwoTexts(Elements elements) {
+        List<String> values = new ArrayList<>();
+        for (Element el : elements) {
+            String value = clean(el.text());
+            if (value == null || parseOdds(value) != null) continue;
+            if (!values.contains(value)) values.add(value);
+            if (values.size() == 2) break;
         }
-
-        if (values.size() < 2) {
-            return null;
-        }
-
-        return new String[]{
-                values.get(0),
-                values.get(1)
-        };
+        return values.size() >= 2 ? new String[]{values.get(0), values.get(1)} : null;
     }
 
-    private String[] extractFirstTwoAttributes(
-            Elements elements
-    ) {
-
-        List<String> values =
-                new ArrayList<>();
-
-        for (Element element : elements) {
-
-            String value =
-                    clean(element.attr("data-member-name"));
-
-            if (value == null) {
-                continue;
-            }
-
-            if (!values.contains(value)) {
-                values.add(value);
-            }
-
-            if (values.size() == 2) {
-                break;
-            }
+    private String[] extractFirstTwoAttributes(Elements elements) {
+        List<String> values = new ArrayList<>();
+        for (Element el : elements) {
+            String value = clean(el.attr("data-member-name"));
+            if (value == null) continue;
+            if (!values.contains(value)) values.add(value);
+            if (values.size() == 2) break;
         }
-
-        if (values.size() < 2) {
-            return null;
-        }
-
-        return new String[]{
-                values.get(0),
-                values.get(1)
-        };
+        return values.size() >= 2 ? new String[]{values.get(0), values.get(1)} : null;
     }
 
-    /**
-     * Разделяем название события на команды.
-     */
-    private String[] splitTeams(
-            String text
-    ) {
-
-        if (text == null) {
-            return null;
+    private String[] splitTeams(String text) {
+        if (text == null) return null;
+        String[] separators = {" - ", " — ", " – ", " vs ", " VS ", " против "};
+        for (String sep : separators) {
+            int idx = text.indexOf(sep);
+            if (idx <= 0) continue;
+            String t1 = clean(text.substring(0, idx));
+            String t2 = clean(text.substring(idx + sep.length()));
+            if (t1 != null && t2 != null && t1.length() <= 150 && t2.length() <= 150) {
+                return new String[]{t1, t2};
+            }
         }
-
-        String[] separators = {
-                " - ",
-                " — ",
-                " – ",
-                " vs ",
-                " VS ",
-                " против "
-        };
-
-        for (String separator : separators) {
-
-            int index =
-                    text.indexOf(separator);
-
-            if (index <= 0) {
-                continue;
-            }
-
-            String team1 =
-                    clean(
-                            text.substring(
-                                    0,
-                                    index
-                            )
-                    );
-
-            String team2 =
-                    clean(
-                            text.substring(
-                                    index + separator.length()
-                            )
-                    );
-
-            if (team1 == null ||
-                    team2 == null) {
-                continue;
-            }
-
-            /*
-             * Отсекаем слишком длинные варианты,
-             * которые явно являются не названием матча.
-             */
-            if (team1.length() > 150 ||
-                    team2.length() > 150) {
-                continue;
-            }
-
-            return new String[]{
-                    team1,
-                    team2
-            };
-        }
-
         return null;
     }
 
-    /**
-     * URL события.
-     */
-    private String extractEventUrl(
-            Element eventBlock
-    ) {
+    // ======================== EVENT META ========================
 
-        Element link =
-                eventBlock.select(
-                                "a[href]"
-                        ).stream()
-                        .filter(
-                                e -> {
-                                    String href =
-                                            clean(e.attr("href"));
-
-                                    return href != null &&
-                                            (
-                                                    href.contains("/betting/") ||
-                                                            href.contains("/su/")
-                                            );
-                                }
-                        )
-                        .findFirst()
-                        .orElse(null);
-
-        if (link == null) {
-            return null;
-        }
-
-        String href =
-                clean(link.attr("href"));
-
-        if (href == null) {
-            return null;
-        }
-
-        if (href.startsWith("http://") ||
-                href.startsWith("https://")) {
-            return href;
-        }
-
-        if (href.startsWith("/")) {
-            return BASE_URL + href;
-        }
-
-        return BASE_URL + "/" + href;
+    private String extractEventUrl(Element eventBlock) {
+        Element link = eventBlock.select("a[href]").stream()
+                .filter(e -> {
+                    String href = clean(e.attr("href"));
+                    return href != null && (href.contains("/betting/") || href.contains("/su/"));
+                })
+                .findFirst().orElse(null);
+        if (link == null) return null;
+        String href = clean(link.attr("href"));
+        if (href == null) return null;
+        if (href.startsWith("http")) return href;
+        return href.startsWith("/") ? BASE_URL + href : BASE_URL + "/" + href;
     }
 
-    /**
-     * Время события.
-     */
-    private LocalDateTime extractStartTime(
-            Element eventBlock
-    ) {
+    private LocalDateTime extractStartTime(Element eventBlock) {
+        String dateText = clean(firstNonBlank(
+                eventBlock.select(".date-wrapper").text(),
+                eventBlock.select(".date").text(),
+                eventBlock.select("[class*='date']").text()));
+        LocalDate today = LocalDate.now();
+        if (dateText == null) return today.atStartOfDay();
 
-        String dateText =
-                firstNonBlank(
-                        eventBlock.select(".date-wrapper").text(),
-                        eventBlock.select(".date").text(),
-                        eventBlock.select(
-                                "[class*='date']"
-                        ).text()
-                );
-
-        dateText = clean(dateText);
-
-        LocalDate today =
-                LocalDate.now();
-
-        if (dateText == null) {
-            return today.atStartOfDay();
-        }
-
-        Matcher matcher =
-                TIME_PATTERN.matcher(dateText);
-
-        if (!matcher.find()) {
-            return today.atStartOfDay();
-        }
+        Matcher matcher = TIME_PATTERN.matcher(dateText);
+        if (!matcher.find()) return today.atStartOfDay();
 
         try {
-
-            LocalTime time =
-                    LocalTime.parse(
-                            matcher.group(1),
-                            TIME_FORMAT
-                    );
-
-            LocalDate date =
-                    today;
-
-            String lower =
-                    dateText.toLowerCase(
-                            Locale.ROOT
-                    );
-
-            if (lower.contains("завтра")) {
-                date = today.plusDays(1);
-            }
-
-            return LocalDateTime.of(
-                    date,
-                    time
-            );
-
+            LocalTime time = LocalTime.parse(matcher.group(1), TIME_FORMAT);
+            LocalDate date = dateText.toLowerCase(Locale.ROOT).contains("завтра")
+                    ? today.plusDays(1) : today;
+            return LocalDateTime.of(date, time);
         } catch (DateTimeParseException e) {
-
             return today.atStartOfDay();
         }
     }
 
-    /**
-     * Лига.
-     */
-    private String extractLeague(
-            Element eventBlock
-    ) {
-
-        String[] selectors = {
-                ".sport-category-name",
-                ".category-name",
-                ".name-field",
-                ".category-link",
-                "[class*='category']"
-        };
-
-        for (String selector : selectors) {
-
-            Element element =
-                    eventBlock
-                            .select(selector)
-                            .first();
-
-            if (element == null) {
-                continue;
-            }
-
-            String value =
-                    clean(element.text());
-
-            if (value != null &&
-                    value.length() < 200) {
-
-                return value;
-            }
+    private String extractLeague(Element eventBlock) {
+        String[] selectors = {".sport-category-name", ".category-name", ".name-field",
+                ".category-link", "[class*='category']"};
+        for (String sel : selectors) {
+            Element el = eventBlock.select(sel).first();
+            if (el == null) continue;
+            String val = clean(el.text());
+            if (val != null && val.length() < 200) return val;
         }
-
-        String path =
-                firstNonBlank(
-                        eventBlock.attr("data-event-path"),
-                        eventBlock.attr("data-path")
-                );
-
-        path = clean(path);
-
+        String path = clean(firstNonBlank(
+                eventBlock.attr("data-event-path"), eventBlock.attr("data-path")));
         if (path != null) {
-
-            String decoded =
-                    path
-                            .replace("+", " ")
-                            .replace("%20", " ");
-
-            String[] parts =
-                    decoded.split("/");
-
+            String[] parts = path.replace("+", " ").replace("%20", " ").split("/");
             if (parts.length >= 3) {
-
-                String league =
-                        clean(parts[2]);
-
-                if (league != null) {
-                    return league;
-                }
+                String league = clean(parts[2]);
+                if (league != null) return league;
             }
         }
-
         return "Футбол";
     }
 
+    // ======================== MARKETS ========================
+
     /**
-     * =========================================================
-     *                     РЫНКИ
-     * =========================================================
-     * Здесь намеренно НЕ ограничиваемся одним конкретным
-     * классом Marathon.
-     * Ищем все потенциальные market-контейнеры.
+     * Определяет канонический тип рынка по содержимому исходов.
+     * Это ключевое исправление: раньше market_type брался из DOM
+     * и часто был "Рынок 1", теперь определяется по исходам.
      */
-    private List<RawEvent.RawMarket> extractMarkets(
-            Element eventBlock
-    ) {
-
-        List<RawEvent.RawMarket> markets =
-                new ArrayList<>();
-
-        Set<String> processed =
-                new HashSet<>();
-
-        /*
-         * Основной вариант.
-         */
-        Elements marketBlocks =
-                eventBlock.select(
-                        "[data-preference-id]"
-                );
-
-        log.debug(
-                "[Marathon] Потенциальных market blocks: {}",
-                marketBlocks.size()
-        );
-
-        /*
-         * Если preference-id отсутствует,
-         * ищем по классам.
-         */
-        if (marketBlocks.isEmpty()) {
-
-            marketBlocks =
-                    eventBlock.select(
-                            "[class*='market']"
-                    );
+    private String inferMarketType(String rawName, List<RawEvent.RawOutcome> outcomes) {
+        if (outcomes == null || outcomes.isEmpty()) {
+            return normalizeRawName(rawName);
         }
 
-        for (Element marketBlock :
-                marketBlocks) {
+        Set<String> names = outcomes.stream()
+                .map(o -> o.name().toLowerCase(Locale.ROOT).trim())
+                .collect(Collectors.toSet());
 
-            try {
+        // Проверка по чистым именам исходов (Fonbet/Winline стиль)
+        boolean hasHome = names.stream().anyMatch(n ->
+                n.matches(".*(п1|home|team\\s*1|^1$).*"));
+        boolean hasDraw = names.stream().anyMatch(n ->
+                n.matches(".*(x|draw|ничья).*"));
+        boolean hasAway = names.stream().anyMatch(n ->
+                n.matches(".*(п2|away|team\\s*2|^2$).*"));
 
-                /*
-                 * Не считаем вложенные элементы отдельными
-                 * рынками, если они сами являются частью
-                 * market-контейнера.
-                 */
-                Element parentMarket =
-                        marketBlock.parent();
+        if (hasHome && hasDraw && hasAway) return "1X2";
 
-                if (parentMarket != null &&
-                        parentMarket != eventBlock &&
-                        parentMarket.hasAttr(
-                                "data-preference-id"
-                        )) {
-                    continue;
+        // Проверка по формату Marathon: "команда | (фора) кф" или "команда | кф"
+        // Если есть исходы с форами типа (+1.0), (-1.0), (0) — это HANDICAP
+        boolean hasHandicapFormat = names.stream().anyMatch(n ->
+                n.matches(".*\\([+-]?\\d+\\.?\\d*\\).*"));
+        if (hasHandicapFormat) return "HANDICAP";
+
+        // Проверка по тоталам
+        boolean hasOver = names.stream().anyMatch(n ->
+                n.contains("больше") || n.contains("over") || n.contains("тб") || n.matches(".*\\+\\d+.*"));
+        boolean hasUnder = names.stream().anyMatch(n ->
+                n.contains("меньше") || n.contains("under") || n.contains("тм") || n.matches(".*-\\d+.*"));
+        if (hasOver && hasUnder) return "TOTAL_OVER_UNDER";
+
+        // Если ровно 2-3 исхода без фор — вероятно 1X2
+        if (outcomes.size() >= 2 && outcomes.size() <= 3 && !hasHandicapFormat) {
+            return "1X2";
+        }
+
+        return normalizeRawName(rawName);
+    }
+
+    private String normalizeRawName(String rawName) {
+        if (rawName == null) return "UNKNOWN";
+        String lower = rawName.toLowerCase(Locale.ROOT);
+        if (lower.matches(".*1.?x.?2.*") || lower.contains("исход матча")) return "1X2";
+        if (lower.contains("тотал") || lower.contains("total")) return "TOTAL_OVER_UNDER";
+        if (lower.contains("фора") || lower.contains("handicap")) return "HANDICAP";
+        return rawName.toUpperCase(Locale.ROOT).replaceAll("[^A-Z0-9_]", "_");
+    }
+
+
+    private List<RawEvent.RawMarket> extractMarkets(Element eventBlock) {
+        List<RawEvent.RawMarket> markets = new ArrayList<>();
+        Set<String> processed = new HashSet<>();
+
+        // === Основной метод: data-selection-price + data-selection-key ===
+        // Marathon использует data-selection-key вида "eventId@Match_Result.1"
+        // где .1 = П1, .X = Ничья, .2 = П2
+        Elements selectionLinks = eventBlock.select("[data-selection-price]");
+
+        if (!selectionLinks.isEmpty()) {
+            // Группируем по market-type из родительского элемента
+            Map<String, List<RawEvent.RawOutcome>> groupedByMarket = new LinkedHashMap<>();
+
+            for (Element sel : selectionLinks) {
+                String priceStr = clean(sel.attr("data-selection-price"));
+                BigDecimal odds = parseOdds(priceStr);
+                if (odds == null) continue;
+
+                String selectionKey = sel.attr("data-selection-key");
+                String outcomeName = extractOutcomeFromSelectionKey(selectionKey);
+
+                if (outcomeName == null) {
+                    // Fallback: пробуем найти текст рядом
+                    outcomeName = findOutcomeText(sel);
                 }
+                if (outcomeName == null) continue;
 
-                String preferenceId =
-                        clean(
-                                marketBlock.attr(
-                                        "data-preference-id"
-                                )
-                        );
+                // Определяем группу рынка по data-market-type родителя
+                String marketType = findParentAttr(sel, "data-market-type");
+                if (marketType == null) marketType = "RESULT";
 
-                String marketName =
-                        extractMarketName(
-                                marketBlock
-                        );
+                groupedByMarket.computeIfAbsent(marketType, k -> new ArrayList<>())
+                        .add(new RawEvent.RawOutcome(outcomeName, odds));
+            }
 
-                /*
-                 * Даже если название рынка не найдено,
-                 * попробуем построить его из preference-id.
-                 */
-                if (marketName == null) {
+            for (Map.Entry<String, List<RawEvent.RawOutcome>> entry : groupedByMarket.entrySet()) {
+                List<RawEvent.RawOutcome> outcomes = deduplicateOutcomes(entry.getValue());
+                if (outcomes.isEmpty()) continue;
 
-                    marketName =
-                            preferenceId == null
-                                    ? "Рынок"
-                                    : "Рынок " + preferenceId;
-                }
+                String inferredType = inferMarketType(entry.getKey(), outcomes);
+                String key = inferredType.toLowerCase(Locale.ROOT);
+                if (!processed.add(key)) continue;
 
-                List<RawEvent.RawOutcome> outcomes =
-                        extractMarketOutcomes(
-                                marketBlock
-                        );
-
-                if (outcomes.isEmpty()) {
-                    continue;
-                }
-
-                String key =
-                        marketName
-                                .trim()
-                                .toLowerCase(
-                                        Locale.ROOT
-                                );
-
-                if (!processed.add(key)) {
-                    continue;
-                }
-
-                markets.add(
-                        new RawEvent.RawMarket(
-                                marketName,
-                                outcomes
-                        )
-                );
-
-            } catch (Exception e) {
-
-                log.debug(
-                        "[Marathon] Ошибка разбора market: {}",
-                        e.getMessage()
-                );
+                markets.add(new RawEvent.RawMarket(inferredType, outcomes));
             }
         }
 
-        /*
-         * Иногда рынки представлены таблицами
-         * непосредственно внутри eventBlock,
-         * без ожидаемого market-wrapper.
-         */
+        // === Fallback: старый формат с data-preference-id ===
         if (markets.isEmpty()) {
+            Elements marketBlocks = eventBlock.select("[data-preference-id]");
+            if (marketBlocks.isEmpty()) {
+                marketBlocks = eventBlock.select("[class*='market']");
+            }
+            for (Element marketBlock : marketBlocks) {
+                try {
+                    Element parentMarket = marketBlock.parent();
+                    if (parentMarket != null && parentMarket != eventBlock
+                            && parentMarket.hasAttr("data-preference-id")) continue;
 
-            log.debug(
-                    "[Marathon] Wrapper markets не найдены. " +
-                            "Пробуем искать таблицы напрямую."
-            );
+                    String marketName = extractMarketName(marketBlock);
+                    List<RawEvent.RawOutcome> outcomes = extractMarketOutcomes(marketBlock);
+                    if (outcomes.isEmpty()) continue;
 
-            Elements tables =
-                    eventBlock.select("table");
+                    String inferredType = inferMarketType(marketName, outcomes);
+                    String key = inferredType.trim().toLowerCase(Locale.ROOT);
+                    if (!processed.add(key)) continue;
 
-            int counter = 0;
-
-            for (Element table : tables) {
-
-                List<RawEvent.RawOutcome> outcomes =
-                        extractTableOutcomes(table);
-
-                if (outcomes.isEmpty()) {
-                    continue;
+                    markets.add(new RawEvent.RawMarket(inferredType, outcomes));
+                } catch (Exception e) {
+                    log.debug("[Marathon] Ошибка разбора market: {}", e.getMessage());
                 }
-
-                counter++;
-
-                markets.add(
-                        new RawEvent.RawMarket(
-                                "Рынок " + counter,
-                                outcomes
-                        )
-                );
             }
         }
 
-        log.debug(
-                "[Marathon] Найдено рынков: {}",
-                markets.size()
-        );
-
+        log.debug("[Marathon] Найдено рынков: {}", markets.size());
         return markets;
     }
 
     /**
-     * Название рынка.
+     * Извлекает название исхода из data-selection-key.
+     * Формат: "eventId@Match_Result.1" → "1" (П1)
+     *         "eventId@Match_Result.X" → "X" (Ничья)
+     *         "eventId@Match_Result.2" → "2" (П2)
+     *         "eventId@Handicap.1"     → фора 1
+     *         "eventId@Total.Under"    → тотал меньше
      */
-    private String extractMarketName(
-            Element marketBlock
-    ) {
+    private String extractOutcomeFromSelectionKey(String selectionKey) {
+        if (selectionKey == null || selectionKey.isBlank()) return null;
 
-        String[] selectors = {
-                ".name-field",
-                ".market-name",
-                ".market-title",
-                ".market-header",
-                "[class*='market-name']",
-                "[class*='market-title']"
-        };
+        // Берём часть после @
+        int atIdx = selectionKey.lastIndexOf('@');
+        if (atIdx < 0 || atIdx >= selectionKey.length() - 1) return null;
 
-        for (String selector : selectors) {
+        String afterAt = selectionKey.substring(atIdx + 1);
 
-            Element name =
-                    marketBlock
-                            .select(selector)
-                            .first();
+        // Берём часть после последней точки
+        int dotIdx = afterAt.lastIndexOf('.');
+        if (dotIdx < 0 || dotIdx >= afterAt.length() - 1) return null;
 
-            if (name == null) {
-                continue;
-            }
+        String marketPart = afterAt.substring(0, dotIdx);
+        String outcomePart = afterAt.substring(dotIdx + 1);
 
-            String value =
-                    clean(name.text());
-
-            if (value != null &&
-                    value.length() < 250) {
-
-                return value;
-            }
+        // Для Match_Result: 1, X, 2 — это чистые имена исходов 1X2
+        if ("Match_Result".equalsIgnoreCase(marketPart)) {
+            return outcomePart; // "1", "X", "2"
         }
 
-        /*
-         * Если preference-id есть, а name-field нет,
-         * можно посмотреть ближайший заголовок.
-         */
-        Elements headings =
-                marketBlock.select(
-                        "h1,h2,h3,h4,th"
-                );
+        // Для других рынков возвращаем "marketPart.outcomePart"
+        return marketPart + "." + outcomePart;
+    }
 
-        for (Element heading : headings) {
-
-            String value =
-                    clean(heading.text());
-
-            if (value != null &&
-                    value.length() < 150 &&
-                    parseOdds(value) == null) {
-
-                return value;
+    /**
+     * Ищет атрибут у родительских элементов (до 5 уровней вверх).
+     */
+    private String findParentAttr(Element element, String attrName) {
+        Element current = element;
+        for (int i = 0; i < 5 && current != null; i++) {
+            if (current.hasAttr(attrName)) {
+                String val = clean(current.attr(attrName));
+                if (val != null) return val;
             }
+            current = current.parent();
         }
-
         return null;
     }
 
-    /**
-     * Извлекаем ВСЕ исходы рынка.
-     */
-    private List<RawEvent.RawOutcome> extractMarketOutcomes(
-            Element marketBlock
-    ) {
 
-        List<RawEvent.RawOutcome> outcomes =
-                new ArrayList<>();
-
-        /*
-         * Сначала работаем с таблицами.
-         */
-        Elements tables =
-                marketBlock.select("table");
-
-        for (Element table : tables) {
-
-            outcomes.addAll(
-                    extractTableOutcomes(table)
-            );
+    private String extractMarketName(Element marketBlock) {
+        String[] selectors = {".name-field", ".market-name", ".market-title",
+                ".market-header", "[class*='market-name']", "[class*='market-title']"};
+        for (String sel : selectors) {
+            Element name = marketBlock.select(sel).first();
+            if (name == null) continue;
+            String val = clean(name.text());
+            if (val != null && val.length() < 250) return val;
         }
-
-        /*
-         * Иногда Marathon использует div вместо table.
-         */
-        if (outcomes.isEmpty()) {
-
-            outcomes.addAll(
-                    extractDivOutcomes(
-                            marketBlock
-                    )
-            );
+        Elements headings = marketBlock.select("h1,h2,h3,h4,th");
+        for (Element h : headings) {
+            String val = clean(h.text());
+            if (val != null && val.length() < 150 && parseOdds(val) == null) return val;
         }
-
-        return deduplicateOutcomes(
-                outcomes
-        );
+        return null;
     }
 
-    /**
-     * Парсим таблицу.
-     */
-    private List<RawEvent.RawOutcome> extractTableOutcomes(
-            Element table
-    ) {
+    // ======================== OUTCOMES ========================
 
-        List<RawEvent.RawOutcome> outcomes =
-                new ArrayList<>();
+    private List<RawEvent.RawOutcome> extractMarketOutcomes(Element marketBlock) {
+        List<RawEvent.RawOutcome> outcomes = new ArrayList<>();
+        for (Element table : marketBlock.select("table")) {
+            outcomes.addAll(extractTableOutcomes(table));
+        }
+        if (outcomes.isEmpty()) {
+            outcomes.addAll(extractDivOutcomes(marketBlock));
+        }
+        return deduplicateOutcomes(outcomes);
+    }
 
-        List<String> headers =
-                extractHeaders(table);
+    private List<RawEvent.RawOutcome> extractTableOutcomes(Element table) {
+        List<RawEvent.RawOutcome> outcomes = new ArrayList<>();
+        List<String> headers = extractHeaders(table);
 
-        Elements rows =
-                table.select("tr");
+        for (Element row : table.select("tr")) {
+            String rowLabel = extractRowLabel(row);
+            Elements priceElements = row.select("[data-selection-price]");
+            if (priceElements.isEmpty()) priceElements = row.select(".price");
 
-        for (Element row : rows) {
+            for (Element pe : priceElements) {
+                String priceText = clean(pe.attr("data-selection-price"));
+                if (priceText == null) priceText = clean(pe.text());
+                BigDecimal odds = parseOdds(priceText);
+                if (odds == null) continue;
 
-            String rowLabel =
-                    extractRowLabel(row);
+                String header = findHeaderForPrice(pe, headers);
+                String outcomeName = buildOutcomeName(rowLabel, header);
+                if (outcomeName == null) continue;
 
-            /*
-             * Ищем ВСЕ элементы с коэффициентами,
-             * а не только td.price.
-             */
-            Elements priceElements =
-                    row.select(
-                            "[data-selection-price]"
-                    );
-
-            /*
-             * Резервный вариант.
-             */
-            if (priceElements.isEmpty()) {
-
-                priceElements =
-                        row.select(
-                                ".price"
-                        );
-            }
-
-            for (Element priceElement :
-                    priceElements) {
-
-                String priceText =
-                        clean(
-                                priceElement.attr(
-                                        "data-selection-price"
-                                )
-                        );
-
-                if (priceText == null) {
-                    priceText =
-                            clean(
-                                    priceElement.text()
-                            );
-                }
-
-                BigDecimal odds =
-                        parseOdds(priceText);
-
-                if (odds == null) {
-                    continue;
-                }
-
-                /*
-                 * Определяем header через ближайшую
-                 * позицию ячейки.
-                 */
-                String header =
-                        findHeaderForPrice(
-                                priceElement,
-                                headers
-                        );
-
-                String outcomeName =
-                        buildOutcomeName(
-                                rowLabel,
-                                header
-                        );
-
-                if (outcomeName == null) {
-                    continue;
-                }
-
-                outcomes.add(
-                        new RawEvent.RawOutcome(
-                                outcomeName,
-                                odds
-                        )
-                );
+                outcomes.add(new RawEvent.RawOutcome(outcomeName, odds));
             }
         }
-
         return outcomes;
     }
 
-    /**
-     * Ищем заголовки.
-     */
-    private List<String> extractHeaders(
-            Element table
-    ) {
-
-        List<String> headers =
-                new ArrayList<>();
-
-        Element headerRow =
-                table.select("thead tr").first();
-
-        if (headerRow == null) {
-            headerRow =
-                    table.select("tr").first();
+    private List<String> extractHeaders(Element table) {
+        List<String> headers = new ArrayList<>();
+        Element headerRow = table.select("thead tr").first();
+        if (headerRow == null) headerRow = table.select("tr").first();
+        if (headerRow == null) return headers;
+        for (Element cell : headerRow.select("th,td")) {
+            headers.add(clean(cell.text()));
         }
-
-        if (headerRow == null) {
-            return headers;
-        }
-
-        Elements cells =
-                headerRow.select("th,td");
-
-        for (Element cell : cells) {
-
-            String text =
-                    clean(cell.text());
-
-            headers.add(text);
-        }
-
         return headers;
     }
 
-    /**
-     * Label строки.
-     */
-    private String extractRowLabel(
-            Element row
-    ) {
-
-        /*
-         * Сначала специальные label-классы.
-         */
-        String[] selectors = {
-                ".selection-name",
-                ".row-name",
-                ".label",
-                ".name-field",
-                ".member-name"
-        };
-
-        for (String selector : selectors) {
-
-            Element element =
-                    row.select(selector).first();
-
-            if (element == null) {
-                continue;
-            }
-
-            String text =
-                    clean(element.text());
-
-            if (text != null &&
-                    parseOdds(text) == null) {
-
-                return text;
-            }
+    private String extractRowLabel(Element row) {
+        String[] selectors = {".selection-name", ".row-name", ".label", ".name-field", ".member-name"};
+        for (String sel : selectors) {
+            Element el = row.select(sel).first();
+            if (el == null) continue;
+            String text = clean(el.text());
+            if (text != null && parseOdds(text) == null) return text;
         }
-
-        /*
-         * Затем обычные td/th, исключая коэффициенты.
-         */
-        for (Element cell :
-                row.select("> th, > td")) {
-
-            if (cell.hasClass("price")) {
-                continue;
-            }
-
-            if (cell.hasAttr(
-                    "data-selection-price"
-            )) {
-                continue;
-            }
-
-            String text =
-                    clean(cell.text());
-
-            if (text == null) {
-                continue;
-            }
-
-            if (parseOdds(text) != null) {
-                continue;
-            }
-
-            return text;
+        for (Element cell : row.select("> th, > td")) {
+            if (cell.hasClass("price") || cell.hasAttr("data-selection-price")) continue;
+            String text = clean(cell.text());
+            if (text != null && parseOdds(text) == null) return text;
         }
-
         return null;
     }
 
-    /**
-     * Связываем коэффициент с заголовком.
-     */
-    private String findHeaderForPrice(
-            Element priceElement,
-            List<String> headers
-    ) {
-
-        if (headers.isEmpty()) {
-            return null;
+    private String findHeaderForPrice(Element priceElement, List<String> headers) {
+        if (headers.isEmpty()) return null;
+        Element cell = priceElement;
+        if (!cell.tagName().equalsIgnoreCase("td") && !cell.tagName().equalsIgnoreCase("th")) {
+            Element parent = priceElement.parent();
+            if (parent != null && (parent.tagName().equalsIgnoreCase("td")
+                    || parent.tagName().equalsIgnoreCase("th"))) cell = parent;
         }
-
-        Element cell =
-                priceElement;
-
-        if (!cell.tagName().equalsIgnoreCase("td") &&
-                !cell.tagName().equalsIgnoreCase("th")) {
-
-            Element parent =
-                    priceElement.parent();
-
-            if (parent != null &&
-                    (
-                            parent.tagName().equalsIgnoreCase("td") ||
-                                    parent.tagName().equalsIgnoreCase("th")
-                    )
-            ) {
-                cell = parent;
-            }
+        int index = cell.elementSiblingIndex();
+        if (index >= 0 && index < headers.size()) {
+            String h = clean(headers.get(index));
+            if (h != null && !h.isBlank()) return h;
         }
-
-        int index =
-                cell.elementSiblingIndex();
-
-        /*
-         * Часто первая колонка — label,
-         * поэтому header может быть смещён.
-         */
-        if (index >= 0 &&
-                index < headers.size()) {
-
-            String header =
-                    clean(headers.get(index));
-
-            if (header != null &&
-                    !header.isBlank()) {
-
-                return header;
-            }
-        }
-
-        /*
-         * Если смещение на один.
-         */
-        int shifted =
-                index - 1;
-
-        if (shifted >= 0 &&
-                shifted < headers.size()) {
-
-            return clean(
-                    headers.get(shifted)
-            );
-        }
-
+        int shifted = index - 1;
+        if (shifted >= 0 && shifted < headers.size()) return clean(headers.get(shifted));
         return null;
     }
 
-    /**
-     * Резервный parser div-исходов.
-     */
-    private List<RawEvent.RawOutcome> extractDivOutcomes(
-            Element marketBlock
-    ) {
-
-        List<RawEvent.RawOutcome> outcomes =
-                new ArrayList<>();
-
-        Elements prices =
-                marketBlock.select(
-                        "[data-selection-price]"
-                );
-
-        for (Element price :
-                prices) {
-
-            String value =
-                    clean(
-                            price.attr(
-                                    "data-selection-price"
-                            )
-                    );
-
-            BigDecimal odds =
-                    parseOdds(value);
-
-            if (odds == null) {
-                continue;
-            }
-
-            String name =
-                    findOutcomeText(price);
-
-            if (name == null) {
-                continue;
-            }
-
-            outcomes.add(
-                    new RawEvent.RawOutcome(
-                            name,
-                            odds
-                    )
-            );
+    private List<RawEvent.RawOutcome> extractDivOutcomes(Element marketBlock) {
+        List<RawEvent.RawOutcome> outcomes = new ArrayList<>();
+        for (Element price : marketBlock.select("[data-selection-price]")) {
+            String value = clean(price.attr("data-selection-price"));
+            BigDecimal odds = parseOdds(value);
+            if (odds == null) continue;
+            String name = findOutcomeText(price);
+            if (name == null) continue;
+            outcomes.add(new RawEvent.RawOutcome(name, odds));
         }
-
         return outcomes;
     }
 
-    /**
-     * Пытаемся найти название исхода около коэффициента.
-     */
-    private String findOutcomeText(
-            Element price
-    ) {
+    private String findOutcomeText(Element price) {
+        String value = clean(firstNonBlank(
+                price.attr("data-selection-name"), price.attr("data-name"),
+                price.attr("aria-label"), price.attr("title")));
+        if (value != null && parseOdds(value) == null) return value;
 
-        /*
-         * data-selection-name.
-         */
-        String value =
-                firstNonBlank(
-                        price.attr(
-                                "data-selection-name"
-                        ),
-                        price.attr(
-                                "data-name"
-                        ),
-                        price.attr(
-                                "aria-label"
-                        ),
-                        price.attr(
-                                "title"
-                        )
-                );
-
-        value = clean(value);
-
-        if (value != null &&
-                parseOdds(value) == null) {
-
-            return value;
-        }
-
-        /*
-         * Соседний элемент.
-         */
-        Element parent =
-                price.parent();
-
+        Element parent = price.parent();
         if (parent != null) {
-
-            for (Element child :
-                    parent.children()) {
-
-                if (child == price) {
-                    continue;
-                }
-
-                String text =
-                        clean(child.text());
-
-                if (text == null) {
-                    continue;
-                }
-
-                if (parseOdds(text) != null) {
-                    continue;
-                }
-
-                return text;
+            for (Element child : parent.children()) {
+                if (child == price) continue;
+                String text = clean(child.text());
+                if (text != null && parseOdds(text) == null) return text;
             }
         }
-
         return null;
     }
 
-    /**
-     * Строим название исхода.
-     */
-    private String buildOutcomeName(
-            String rowLabel,
-            String header
-    ) {
-
+    private String buildOutcomeName(String rowLabel, String header) {
         rowLabel = clean(rowLabel);
         header = clean(header);
-
-        if (rowLabel == null &&
-                header == null) {
-            return null;
-        }
-
-        if (rowLabel != null &&
-                header == null) {
-            return rowLabel;
-        }
-
-        if (rowLabel == null) {
-            return header;
-        }
-
-        if (rowLabel.equalsIgnoreCase(header)) {
-            return rowLabel;
-        }
-
+        if (rowLabel == null && header == null) return null;
+        if (rowLabel != null && header == null) return rowLabel;
+        if (rowLabel == null) return header;
+        if (rowLabel.equalsIgnoreCase(header)) return rowLabel;
         return rowLabel + " | " + header;
     }
 
-    /**
-     * Парсим коэффициент.
-     */
-    private BigDecimal parseOdds(
-            String value
-    ) {
+    // ======================== UTILS ========================
 
-        if (value == null) {
-            return null;
-        }
-
-        String normalized =
-                value
-                        .trim()
-                        .replace(",", ".");
-
-        if (!NUMBER_PATTERN.matcher(
-                normalized
-        ).matches()) {
-            return null;
-        }
-
+    private BigDecimal parseOdds(String value) {
+        if (value == null) return null;
+        String normalized = value.trim().replace(",", ".");
+        if (!NUMBER_PATTERN.matcher(normalized).matches()) return null;
         try {
-
-            BigDecimal odds =
-                    new BigDecimal(normalized);
-
-            if (odds.compareTo(
-                    BigDecimal.ZERO
-            ) <= 0) {
-                return null;
-            }
-
-            if (odds.compareTo(
-                    new BigDecimal("10000")
-            ) > 0) {
-                return null;
-            }
-
+            BigDecimal odds = new BigDecimal(normalized);
+            if (odds.compareTo(BigDecimal.ZERO) <= 0 || odds.compareTo(new BigDecimal("10000")) > 0) return null;
             return odds;
-
         } catch (NumberFormatException e) {
-
             return null;
         }
     }
 
-    /**
-     * Удаляем одинаковые исходы.
-     */
-    private List<RawEvent.RawOutcome> deduplicateOutcomes(
-            List<RawEvent.RawOutcome> outcomes
-    ) {
-
-        Map<String, RawEvent.RawOutcome> unique =
-                new LinkedHashMap<>();
-
-        for (RawEvent.RawOutcome outcome :
-                outcomes) {
-
-            if (outcome == null ||
-                    outcome.name() == null) {
-                continue;
-            }
-
-            String key =
-                    outcome.name()
-                            .trim()
-                            .toLowerCase(
-                                    Locale.ROOT
-                            );
-
-            /*
-             * Если одинаковый исход встретился
-             * несколько раз, оставляем первый.
-             */
-            unique.putIfAbsent(
-                    key,
-                    outcome
-            );
+    private List<RawEvent.RawOutcome> deduplicateOutcomes(List<RawEvent.RawOutcome> outcomes) {
+        Map<String, RawEvent.RawOutcome> unique = new LinkedHashMap<>();
+        for (RawEvent.RawOutcome o : outcomes) {
+            if (o == null || o.name() == null) continue;
+            unique.putIfAbsent(o.name().trim().toLowerCase(Locale.ROOT), o);
         }
-
-        return new ArrayList<>(
-                unique.values()
-        );
+        return new ArrayList<>(unique.values());
     }
 
-    /**
-     * Если у блока нет ID,
-     * создаём стабильный fallback.
-     */
-    private String buildFallbackEventId(
-            Element eventBlock
-    ) {
-
-        String[] teams =
-                extractTeams(eventBlock);
-
-        if (teams == null) {
-            return null;
-        }
-
-        String time =
-                clean(
-                        eventBlock
-                                .select(".date-wrapper")
-                                .text()
-                );
-
-        String raw =
-                teams[0] +
-                        "|" +
-                        teams[1] +
-                        "|" +
-                        time;
-
-        return "fallback_" +
-                Integer.toHexString(
-                        raw.hashCode()
-                );
+    private String buildFallbackEventId(Element eventBlock) {
+        String[] teams = extractTeams(eventBlock);
+        if (teams == null) return null;
+        String time = clean(eventBlock.select(".date-wrapper").text());
+        return "fallback_" + Integer.toHexString((teams[0] + "|" + teams[1] + "|" + time).hashCode());
     }
 
-    private String firstNonBlank(
-            String... values
-    ) {
-
-        if (values == null) {
-            return null;
+    private String firstNonBlank(String... values) {
+        if (values == null) return null;
+        for (String v : values) {
+            if (v != null && !v.trim().isEmpty()) return v;
         }
-
-        for (String value : values) {
-
-            if (value == null) {
-                continue;
-            }
-
-            if (!value.trim().isEmpty()) {
-                return value;
-            }
-        }
-
         return null;
     }
 
-    /**
-     * Чистим HTML-текст.
-     */
-    private String clean(
-            String value
-    ) {
-
-        if (value == null) {
-            return null;
-        }
-
-        String result =
-                value
-                        .replace('\u00A0', ' ')
-                        .replaceAll("\\s+", " ")
-                        .trim();
-
-        if (result.isEmpty()) {
-            return null;
-        }
-
-        return result;
+    private String clean(String value) {
+        if (value == null) return null;
+        String result = value.replace('\u00A0', ' ').replaceAll("\\s+", " ").trim();
+        return result.isEmpty() ? null : result;
     }
 }
