@@ -637,7 +637,7 @@ public class FonbetParser extends AbstractBookmakerParser {
             // КЛЮЧЕВОЕ: используем route.abort() чтобы не ждать загрузку страницы
             // Просто открываем и сразу закрываем через 10 сек
             page.navigate(BASE_URL, new Page.NavigateOptions()
-                    .setTimeout(10_000)
+                    .setTimeout(30_000)
                     .setWaitUntil(com.microsoft.playwright.options.WaitUntilState.DOMCONTENTLOADED));
 
             // Если navigate не выбросил exception — ждём ещё 5 сек для API-запросов

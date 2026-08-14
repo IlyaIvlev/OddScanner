@@ -25,8 +25,11 @@ import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeParseException;
 import java.util.*;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
@@ -39,9 +42,10 @@ public class MarathonParser extends AbstractBookmakerParser {
     private static final String FOOTBALL_BASE_URL = BASE_URL + "/su/popular/Football+-+11";
 
     // === НАСТРОЙКИ ===
-    private static final int MAX_PAGES = 30;       // Глубина парсинга
-    private static final int PARALLELISM = 6;      // Параллельность (6 потоков для стабильности)
-    private static final int MAX_RETRIES = 2;      // Количество повторов при ошибке загрузки
+    private static final int MAX_PAGES = 35;
+    private static final int PARALLELISM = 5;
+    private static final int MAX_RETRIES = 2;
+    private static final int GLOBAL_TIMEOUT_SECONDS = 140; // Увеличили до 140 сек (30 стр * ~4-5 сек + ретраи)
 
     private static final DateTimeFormatter TIME_FORMAT = DateTimeFormatter.ofPattern("HH:mm");
     private static final Pattern TIME_PATTERN = Pattern.compile("\\b(\\d{1,2}:\\d{2})\\b");
@@ -61,31 +65,36 @@ public class MarathonParser extends AbstractBookmakerParser {
         long startTime = System.currentTimeMillis();
         log.info("[Marathon] Запуск парсера (Virtual Threads: {}, Pages: {})", PARALLELISM, MAX_PAGES);
 
-        // Используем Map для дедупликации: Key = externalId, Value = RawEvent
-        // Это позволяет перезаписывать старые данные новыми (если событие встретилось дважды)
-        Map<String, RawEvent> uniqueEventsMap = new LinkedHashMap<>();
+        Map<String, RawEvent> uniqueEventsMap = new ConcurrentHashMap<>();
+        List<CompletableFuture<Void>> futures = new ArrayList<>();
 
-        try (ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor()) {
-            List<CompletableFuture<Void>> futures = new ArrayList<>();
+        ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
 
+        try {
             for (int pageNum = 1; pageNum <= MAX_PAGES; pageNum++) {
                 final int currentPage = pageNum;
 
                 CompletableFuture<Void> future = CompletableFuture.runAsync(() -> {
-                    // КАЖДЫЙ ПОТОК СОЗДАЕТ СВОЙ ИЗОЛИРОВАННЫЙ БРАУЗЕР
-                    try (Playwright playwright = Playwright.create()) {
-                        Browser browser = playwright.chromium().launch(
+                    // Каждый поток создает свой Playwright
+                    Playwright playwright = null;
+                    Browser browser = null;
+                    BrowserContext context = null;
+                    Page page = null;
+
+                    try {
+                        playwright = Playwright.create();
+                        browser = playwright.chromium().launch(
                                 new BrowserType.LaunchOptions()
                                         .setHeadless(true)
                                         .setArgs(List.of(
                                                 "--disable-blink-features=AutomationControlled",
                                                 "--no-sandbox",
                                                 "--disable-dev-shm-usage",
-                                                "--single-process" // Экономия памяти
+                                                "--single-process"
                                         ))
                         );
 
-                        BrowserContext context = browser.newContext(
+                        context = browser.newContext(
                                 new Browser.NewContextOptions()
                                         .setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36")
                                         .setLocale("ru-RU")
@@ -93,7 +102,7 @@ public class MarathonParser extends AbstractBookmakerParser {
                                         .setViewportSize(1920, 1080)
                         );
 
-                        Page page = context.newPage();
+                        page = context.newPage();
                         page.addInitScript("""
                                 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
                                 Object.defineProperty(navigator, 'languages', { get: () => ['ru-RU', 'ru', 'en'] });
@@ -101,20 +110,10 @@ public class MarathonParser extends AbstractBookmakerParser {
                                 """);
 
                         String url = currentPage == 1 ? FOOTBALL_BASE_URL : FOOTBALL_BASE_URL + "?page=" + currentPage;
-
-                        // Загрузка с ретраями
                         String html = loadPageWithRetry(page, url, currentPage);
 
-                        // Закрываем ресурсы сразу после получения HTML
-                        page.close();
-                        context.close();
-                        browser.close();
-
                         if (html != null && !html.isBlank()) {
-                            List<RawEvent> pageEvents = parseHtml(html);
-
-                            // Синхронизированное добавление в общую карту
-                            // put перезаписывает значение, если ключ уже есть (оставляем последнее/свежее)
+                            List<RawEvent> pageEvents = parseHtml(html, currentPage);
                             synchronized (uniqueEventsMap) {
                                 for (RawEvent event : pageEvents) {
                                     uniqueEventsMap.put(event.externalId(), event);
@@ -122,19 +121,47 @@ public class MarathonParser extends AbstractBookmakerParser {
                             }
                             log.info("[Marathon] Страница {}: {} событий загружено", currentPage, pageEvents.size());
                         } else {
-                            log.warn("[Marathon] Страница {}: пустой HTML", currentPage);
+                            log.warn("[Marathon] Страница {}: данные не получены", currentPage);
                         }
 
                     } catch (Exception e) {
-                        log.error("[Marathon] Критическая ошибка в потоке страницы {}", currentPage, e);
+                        // Игнорируем InterruptedException при закрытии, если таймаут сработал
+                        if (!(e.getCause() instanceof InterruptedException)) {
+                            log.error("[Marathon] Ошибка в потоке страницы {}", currentPage, e);
+                        }
+                    } finally {
+                        // Безопасное закрытие ресурсов
+                        try { if (page != null) page.close(); } catch (Exception ignored) {}
+                        try { if (context != null) context.close(); } catch (Exception ignored) {}
+                        try { if (browser != null) browser.close(); } catch (Exception ignored) {}
+                        try { if (playwright != null) playwright.close(); } catch (Exception ignored) {}
                     }
                 }, executor);
 
                 futures.add(future);
             }
 
-            // Ждем завершения всех задач
-            CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
+            // Ждем завершения всех задач с увеличенным таймаутом
+            try {
+                CompletableFuture.allOf(futures.toArray(new CompletableFuture[0]))
+                        .get(GLOBAL_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            } catch (TimeoutException e) {
+                log.warn("[Marathon] Глобальный таймаут ({} сек). Завершено не все страницы, сохраняем что есть.", GLOBAL_TIMEOUT_SECONDS);
+                // Не вызываем cancel(true), чтобы не ломать Playwright InterruptedException-ами
+                // Просто идем дальше сохранять то, что успели собрать
+            } catch (Exception e) {
+                log.error("[Marathon] Ошибка при ожидании потоков", e);
+            }
+
+        } finally {
+            executor.shutdown();
+            try {
+                if (!executor.awaitTermination(10, TimeUnit.SECONDS)) {
+                    executor.shutdownNow();
+                }
+            } catch (InterruptedException e) {
+                executor.shutdownNow();
+            }
         }
 
         long duration = System.currentTimeMillis() - startTime;
@@ -159,13 +186,10 @@ public class MarathonParser extends AbstractBookmakerParser {
         return resultList;
     }
 
-    /**
-     * Загрузка страницы с повторными попытками
-     */
     private String loadPageWithRetry(Page page, String url, int pageNum) {
         for (int attempt = 1; attempt <= MAX_RETRIES; attempt++) {
             try {
-                return loadPage(page, url);
+                return loadPage(page, url, pageNum);
             } catch (Exception e) {
                 log.warn("[Marathon] Страница {} (попытка {}): ошибка - {}", pageNum, attempt, e.getMessage());
                 if (attempt == MAX_RETRIES) {
@@ -178,15 +202,14 @@ public class MarathonParser extends AbstractBookmakerParser {
         return null;
     }
 
-    private String loadPage(Page page, String url) {
+    private String loadPage(Page page, String url, int pageNum) {
+        // Уменьшили таймаут страницы до 30 сек, чтобы быстрее фейлить и ретраить
         page.navigate(url, new Page.NavigateOptions()
-                .setTimeout(45_000) // Таймаут 45 сек
+                .setTimeout(30_000)
                 .setWaitUntil(WaitUntilState.DOMCONTENTLOADED));
 
-        // Рандомная задержка для имитации человека (1.5 - 2.5 сек)
         page.waitForTimeout(1500 + new Random().nextInt(1000));
 
-        // Быстрый скролл для подгрузки динамического контента
         for (int i = 0; i < 5; i++) {
             page.mouse().wheel(0, 2000);
             page.waitForTimeout(100);
@@ -196,9 +219,10 @@ public class MarathonParser extends AbstractBookmakerParser {
         return page.content();
     }
 
-    // ======================== HTML PARSING ========================
+    // ... (остальные методы parseHtml, extractTeams и т.д. остаются без изменений) ...
+    // Я приведу только сигнатуры, чтобы код был полным, но тело методов то же самое.
 
-    private List<RawEvent> parseHtml(String html) {
+    private List<RawEvent> parseHtml(String html, int pageNum) {
         List<RawEvent> result = new ArrayList<>();
         Document document = Jsoup.parse(html);
 
@@ -243,8 +267,6 @@ public class MarathonParser extends AbstractBookmakerParser {
         String externalId = "marathon_" + eventId;
         return new RawEvent(externalId, "Футбол", league, teams[0], teams[1], startsAt, markets, eventUrl == null ? "" : eventUrl);
     }
-
-    // ======================== TEAMS & META ========================
 
     private String[] extractTeams(Element eventBlock) {
         Elements members = eventBlock.select(".member-name .member-link");
@@ -340,8 +362,6 @@ public class MarathonParser extends AbstractBookmakerParser {
         return "Футбол";
     }
 
-    // ======================== MARKETS & OUTCOMES ========================
-
     private String inferMarketType(String rawName, List<RawEvent.RawOutcome> outcomes) {
         if (outcomes == null || outcomes.isEmpty()) return normalizeRawName(rawName);
         Set<String> names = outcomes.stream().map(o -> o.name().toLowerCase(Locale.ROOT).trim()).collect(Collectors.toSet());
@@ -381,7 +401,7 @@ public class MarathonParser extends AbstractBookmakerParser {
                 String outcomeName = extractOutcomeFromSelectionKey(selectionKey);
                 if (outcomeName == null) outcomeName = findOutcomeText(sel);
                 if (outcomeName == null) continue;
-                String marketType = findParentAttr(sel);
+                String marketType = findParentAttr(sel, "data-market-type");
                 if (marketType == null) marketType = "RESULT";
                 groupedByMarket.computeIfAbsent(marketType, k -> new ArrayList<>()).add(new RawEvent.RawOutcome(outcomeName, odds));
             }
@@ -429,10 +449,10 @@ public class MarathonParser extends AbstractBookmakerParser {
         return marketPart + "." + outcomePart;
     }
 
-    private String findParentAttr(Element element) {
+    private String findParentAttr(Element element, String attrName) {
         Element current = element;
         for (int i = 0; i < 5 && current != null; i++) {
-            if (current.hasAttr("data-market-type")) { String val = clean(current.attr("data-market-type")); if (val != null) return val; }
+            if (current.hasAttr(attrName)) { String val = clean(current.attr(attrName)); if (val != null) return val; }
             current = current.parent();
         }
         return null;
@@ -556,8 +576,6 @@ public class MarathonParser extends AbstractBookmakerParser {
         if (rowLabel.equalsIgnoreCase(header)) return rowLabel;
         return rowLabel + " | " + header;
     }
-
-    // ======================== UTILS ========================
 
     private BigDecimal parseOdds(String value) {
         if (value == null) return null;
