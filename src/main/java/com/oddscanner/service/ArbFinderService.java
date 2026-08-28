@@ -91,15 +91,15 @@ public class ArbFinderService {
         String n1 = normalizeLeagueForCompare(l1);
         String n2 = normalizeLeagueForCompare(l2);
 
-        // Прямое совпадение после очистки
         if (n1.equals(n2)) return true;
 
-        // Проверка на вхождение ключевого слова (более короткая строка должна содержаться в длинной)
-        // Минимальная длина 4 символа, чтобы избежать ложных срабатываний на словах типа "cup"
+        // Проверяем вхождение только если длины строк отличаются не более чем в 2 раза
+        // Это отсекает ситуации вроде "cup" vs "super cup league"
         if (n1.length() > 4 && n2.length() > 4) {
             String shorter = n1.length() < n2.length() ? n1 : n2;
             String longer = n1.length() < n2.length() ? n2 : n1;
-            if (longer.contains(shorter)) {
+
+            if (longer.length() <= shorter.length() * 2 && longer.contains(shorter)) {
                 return true;
             }
         }

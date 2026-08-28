@@ -18,14 +18,19 @@ public class OutcomeNormalizer {
         String lowerName = rawOutcomeName.toLowerCase().trim();
 
         // --- 1. Основной исход (1X2) ---
-        if (lowerType.equals("1x2") || lowerType.contains("main") || lowerType.contains("основное")) {
+        // Поддерживаем разные названия: "1X2", "Main", "Основной исход", "Исход"
+        if (lowerType.equals("1x2") ||
+                lowerType.contains("main") ||
+                lowerType.contains("основн") ||
+                lowerType.equals("исход")) {
+
             String std = map1x2(lowerName);
             if (std != null) return new MarketKey(TYPE_1X2, std);
         }
 
         // --- 2. Тоталы ---
         if (lowerType.contains("total") || lowerType.contains("тотал")) {
-            String std = mapTotal(rawOutcomeName); // Передаем оригинал, чтобы ловить ТБ/ТМ
+            String std = mapTotal(rawOutcomeName);
             if (std != null) return new MarketKey(TYPE_TOTAL, std);
         }
 
