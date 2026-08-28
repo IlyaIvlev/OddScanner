@@ -4,8 +4,10 @@ import com.oddscanner.parser.AbstractBookmakerParser;
 import com.oddscanner.parser.BookmakerParser;
 import com.oddscanner.parser.RawEvent;
 import com.oddscanner.repository.EventRepository;
-import jakarta.annotation.PostConstruct;
+import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.boot.CommandLineRunner;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
@@ -16,25 +18,32 @@ import java.util.concurrent.*;
 
 @Slf4j
 @Component
-public class ScanOrchestrator {
+@RequiredArgsConstructor
+public class ScanOrchestrator implements CommandLineRunner {
 
     private final List<BookmakerParser> parsers;
     private final EventRepository eventRepository;
+
+    @Value("${parser.clear-events-on-startup:false}")
+    private boolean clearEventsOnStartup;
+
     private final ExecutorService executor = Executors.newFixedThreadPool(5);
     private static final DateTimeFormatter FMT = DateTimeFormatter.ofPattern("HH:mm:ss");
     private static final int MAX_ERROR_LEN = 22;
 
-    public ScanOrchestrator(List<BookmakerParser> parsers, EventRepository eventRepository) {
-        this.parsers = parsers;
-        this.eventRepository = eventRepository;
-    }
+    // Этот метод вызовется ОДИН РАЗ после полного запуска приложения
+    @Override
+    public void run(String... args) throws Exception {
+        if (clearEventsOnStartup) {
+            log.warn("🧹 Активирована опция очистки событий при запуске.");
+            eventRepository.clearAllEvents();
+        }
 
-    @PostConstruct
-    public void logActiveParsers() {
+        // Выводим статус парсеров ОДИН РАЗ при старте
         printReport("🤖 ПАРСЕРЫ ПРИ ЗАПУСКЕ", null, null);
     }
 
-    @Scheduled(fixedDelayString = "${parser.scan-interval:60000}")
+    @Scheduled(fixedDelayString = "${parser.scan-interval:45000}")
     public void runScan() {
         String timestamp = LocalDateTime.now().format(FMT);
 
@@ -85,7 +94,6 @@ public class ScanOrchestrator {
         StringBuilder sb = new StringBuilder();
         sb.append("\n");
 
-        // Ширина внутренней части: 58 символов
         int width = 58;
         String h = "═".repeat(width);
         String border = "╔" + h + "╗";
@@ -94,7 +102,6 @@ public class ScanOrchestrator {
 
         sb.append(border).append("\n");
 
-        // Центрируем заголовок
         int pad = (width - title.length()) / 2;
         sb.append("║").append(" ".repeat(Math.max(0, pad)))
                 .append(title)
@@ -136,25 +143,11 @@ public class ScanOrchestrator {
                 }
             }
 
-            // --- МАГИЯ ВЫРАВНИВАНИЯ ---
-            // Эмодзи ⏸️ занимает 2 символа в консоли Windows, ✅ и ❌ — 2 символа.
-            // Но Java считает их как 1-2 char. Поэтому мы фиксируем ширину поля под имя.
-
-            // 1. Иконка + пробел (визуально ~3 символа)
-            // 2. Имя: фиксируем ширину 11 символов (Bet365=6, Polymarket=10)
-            // 3. Разделитель │
-            // 4. Статус: остаток ширины
-
-            String namePart = String.format("%-11s", name); // Имя всегда 11 символов
-
-            // Считаем визуальную ширину статусной части
-            // Общая ширина 58. Минус рамки (2), минус иконка+пробел (3), минус имя (11), минус разделители (3) = 38 на статус
+            String namePart = String.format("%-11s", name);
             int statusWidth = 38;
             String statusPart = String.format("%-" + statusWidth + "s", statusStr);
 
-            // Собираем строку вручную
             String line = "║ " + icon + " " + namePart + " │ " + statusPart + " ║";
-
             sb.append(line).append("\n");
         }
 

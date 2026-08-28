@@ -77,4 +77,20 @@ public class EventRepository {
                 .fetchOne(Tables.BOOKMAKERS.IS_ACTIVE);
         return isActive != null && isActive;
     }
+
+    public void clearAllEvents() {
+        log.warn("[EventRepository] Быстрая очистка всех событий (TRUNCATE CASCADE)...");
+
+        // Отключаем триггеры для скорости, но используем CASCADE для безопасности FK
+        dsl.execute("SET session_replication_role = 'replica'");
+
+        try {
+            // Один запрос очищает всё дерево зависимостей
+            dsl.execute("TRUNCATE TABLE events RESTART IDENTITY CASCADE");
+            log.info("[EventRepository] Таблица EVENTS и связанные данные успешно очищены.");
+        } finally {
+            // Обязательно включаем проверки обратно
+            dsl.execute("SET session_replication_role = 'origin'");
+        }
+    }
 }
