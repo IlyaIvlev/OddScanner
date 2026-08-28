@@ -23,7 +23,7 @@ public class ArbFinderService {
     private final OutcomeNormalizer normalizer;
 
     public List<ArbitrageOpportunity> findArbitrages() {
-        log.info(" Запуск поиска вилок (оптимизированный режим)...");
+        log.info("🔍 Запуск поиска вилок (оптимизированный режим)...");
         long start = System.currentTimeMillis();
 
         // Сортировка по времени обязательна для работы break по isTimeTooFar
@@ -32,7 +32,7 @@ public class ArbFinderService {
                 .orderBy(Tables.EVENTS.START_TIME.asc())
                 .fetch();
 
-        log.info("📊 Загружено {} событий для анализа", events.size());
+        log.info(" Загружено {} событий для анализа", events.size());
 
         List<ArbitrageOpportunity> opportunities = new ArrayList<>();
         int checkedPairs = 0;
@@ -46,21 +46,19 @@ public class ArbFinderService {
                 EventsRecord e2 = events.get(j);
 
                 // ОПТИМИЗАЦИЯ 1: Если время слишком далеко - прерываем внутренний цикл
-                // Но делаем исключение для пар с участием Winline, так как у него кривое время
+                // Но делаем исключение для пар с участием Winline из-за кривого времени
                 boolean isWinlinePair =
                         ("WINLINE".equals(e1.getBookmakerId()) || "WINLINE".equals(e2.getBookmakerId()));
 
-                // Используем matchComparator.isSameMatch как замену isTimeTooFar,
-                // но здесь нам нужна именно проверка времени.
-                // Поскольку isTimeTooFar удален, реализуем простую проверку прямо здесь:
-                long diffMinutes = Math.abs(Duration.between(e1.getStartTime(), e2.getStartTime()).toMinutes());
-
-                if (!isWinlinePair && diffMinutes > 30) {
-                    break;
+                if (!isWinlinePair) {
+                    long diffMinutes = Math.abs(Duration.between(e1.getStartTime(), e2.getStartTime()).toMinutes());
+                    if (diffMinutes > 30) {
+                        break;
+                    }
                 }
 
-                // ОПТИМИЗАЦИЯ 2: Если лиги разные - пропускаем
-                if (!Objects.equals(normalizeLeagueForCompare(e1.getLeague()), normalizeLeagueForCompare(e2.getLeague()))) {
+                // ОПТИМИЗАЦИЯ 2: Умное сравнение лиг вместо строгого равенства
+                if (!isSameLeague(e1.getLeague(), e2.getLeague())) {
                     continue;
                 }
 
@@ -71,7 +69,7 @@ public class ArbFinderService {
 
                 checkedPairs++;
                 if (checkedPairs % 5000 == 0) {
-                    log.debug(" Проверено пар: {}, найдено вилок: {}", checkedPairs, opportunities.size());
+                    log.debug("⏳ Проверено пар: {}, найдено вилок: {}", checkedPairs, opportunities.size());
                 }
             }
         }
@@ -83,7 +81,32 @@ public class ArbFinderService {
         return opportunities;
     }
 
-    // Вспомогательный метод для сравнения лиг (можно вынести в отдельный класс позже)
+    /**
+     * Умное сравнение лиг. Позволяет сопоставлять названия вида:
+     * "Австрия. Бундеслига" <-> "Bundesliga" <-> "Futbol. Avstriya. Bundesliga"
+     */
+    private boolean isSameLeague(String l1, String l2) {
+        if (l1 == null || l2 == null) return false;
+
+        String n1 = normalizeLeagueForCompare(l1);
+        String n2 = normalizeLeagueForCompare(l2);
+
+        // Прямое совпадение после очистки
+        if (n1.equals(n2)) return true;
+
+        // Проверка на вхождение ключевого слова (более короткая строка должна содержаться в длинной)
+        // Минимальная длина 4 символа, чтобы избежать ложных срабатываний на словах типа "cup"
+        if (n1.length() > 4 && n2.length() > 4) {
+            String shorter = n1.length() < n2.length() ? n1 : n2;
+            String longer = n1.length() < n2.length() ? n2 : n1;
+            if (longer.contains(shorter)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     private String normalizeLeagueForCompare(String league) {
         if (league == null) return "";
         return league.toLowerCase()
@@ -101,7 +124,7 @@ public class ArbFinderService {
                     e1.getHomeTeam(), e2.getHomeTeam(), e1.getLeague(), m1.keySet(), m2.keySet());
         } else {
             // Если рынков нет - скорее всего парсер не смог их распарсить
-            log.trace("️ Пустые рынки для пары: {} ({}) vs {} ({})",
+            log.trace("⚠️ Пустые рынки для пары: {} ({}) vs {} ({})",
                     e1.getHomeTeam(), e1.getBookmakerId(), e2.getHomeTeam(), e2.getBookmakerId());
         }
 
