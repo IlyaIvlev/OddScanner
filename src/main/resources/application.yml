@@ -32,7 +32,7 @@ spring:
 parser:
   thread-pool-size: 5
   scan-interval: 45000
-  clear-events-on-startup: false
+  clear-events-on-startup: true
 
 # Actuator / Мониторинг
 management:
