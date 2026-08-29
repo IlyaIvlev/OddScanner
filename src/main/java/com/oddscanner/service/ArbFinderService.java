@@ -25,11 +25,11 @@ public class ArbFinderService {
     public List<ArbitrageOpportunityDto> findArbitrages() {
         log.info("🔍 Запуск поиска вилок...");
 
-        // Оптимизация: выбираем только нужные поля, если их много
         Result<EventsRecord> events = dsl.selectFrom(Tables.EVENTS)
                 .where(Tables.EVENTS.STATUS.eq("SCHEDULED"))
                 .fetch();
 
+        // Группировка по нормализованному названию матча
         Map<String, List<EventsRecord>> groupedEvents = events.stream()
                 .collect(Collectors.groupingBy(e ->
                         normalizeMatchKey(e.getHomeTeam(), e.getAwayTeam())
@@ -45,8 +45,19 @@ public class ArbFinderService {
                     EventsRecord e1 = group.get(i);
                     EventsRecord e2 = group.get(j);
 
-                    // Пропускаем пары из одной БК
+                    // 1. Пропускаем одного букмекера
                     if (Objects.equals(e1.getBookmakerId(), e2.getBookmakerId())) continue;
+
+                    // 2. КРИТИЧЕСКАЯ ПРОВЕРКА: Сравниваем лиги!
+                    // Если лиги разные (например, мужская vs женская), это НЕ один матч
+                    String league1 = normalizeLeagueForCompare(e1.getLeague());
+                    String league2 = normalizeLeagueForCompare(e2.getLeague());
+
+                    if (!league1.equals(league2)) {
+                        log.debug("⏭️ Пропуск пары из-за разных лиг: {} ({}) vs {} ({})",
+                                e1.getHomeTeam(), league1, e2.getHomeTeam(), league2);
+                        continue;
+                    }
 
                     checkMarketsUniversal(e1, e2, opportunities);
                 }
@@ -55,6 +66,13 @@ public class ArbFinderService {
 
         log.info("✅ Поиск завершен. Найдено {} вилок.", opportunities.size());
         return opportunities;
+    }
+
+    private String normalizeLeagueForCompare(String league) {
+        if (league == null) return "";
+        return league.toLowerCase()
+                .replaceAll("[^a-zа-яё0-9]", "")
+                .trim();
     }
 
     private void checkMarketsUniversal(EventsRecord e1, EventsRecord e2,
