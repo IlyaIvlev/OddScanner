@@ -1,7 +1,7 @@
 package com.oddscanner.controller;
 
+import com.oddscanner.dto.ArbitrageOpportunityDto;
 import com.oddscanner.service.ArbFinderService;
-import com.oddscanner.service.ArbFinderService.ArbitrageOpportunity;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import lombok.RequiredArgsConstructor;
@@ -21,7 +21,7 @@ public class ArbitrageController {
 
     @GetMapping("/find")
     @Operation(summary = "Найти текущие арбитражные ситуации (вилки)")
-    public List<ArbitrageOpportunity> findArbitrages() {
+    public List<ArbitrageOpportunityDto> findArbitrages() {
         return arbFinderService.findArbitrages();
     }
 }

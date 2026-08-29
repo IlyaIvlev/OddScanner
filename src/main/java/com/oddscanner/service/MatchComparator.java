@@ -7,36 +7,24 @@ import org.springframework.stereotype.Component;
 public class MatchComparator {
 
     public boolean isSameMatch(EventsRecord e1, EventsRecord e2) {
-        // 1. Сначала проверяем лигу (грубая нормализация)
-        String l1 = normalizeLeague(e1.getLeague());
-        String l2 = normalizeLeague(e2.getLeague());
+        String h1 = normalize(e1.getHomeTeam());
+        String a1 = normalize(e1.getAwayTeam());
+        String h2 = normalize(e2.getHomeTeam());
+        String a2 = normalize(e2.getAwayTeam());
 
-        if (!l1.equals(l2)) {
-            return false;
-        }
+        // Прямое совпадение
+        if (h1.equals(h2) && a1.equals(a2)) return true;
 
-        // 2. Сравниваем команды без учета времени
-        String h1 = normalizeTeam(e1.getHomeTeam());
-        String a1 = normalizeTeam(e1.getAwayTeam());
-        String h2 = normalizeTeam(e2.getHomeTeam());
-        String a2 = normalizeTeam(e2.getAwayTeam());
+        // Обратное совпадение (редко, но бывает)
+        if (h1.equals(a2) && a1.equals(h2)) return true;
 
-        // Прямое совпадение или зеркальное
-        return (h1.equals(h2) && a1.equals(a2)) || (h1.equals(a2) && a1.equals(h2));
+        return false;
     }
 
-    private String normalizeLeague(String league) {
-        if (league == null) return "";
-        return league.toLowerCase()
-                .replaceAll("[^a-zа-яё0-9]", "")
-                .trim();
-    }
-
-    private String normalizeTeam(String team) {
-        if (team == null) return "";
-        return team.toLowerCase()
-                .replaceAll("\\b(fc|cf|sc|club|team|united|utd|womens?|women|men's?|men|фк|ск|жк|мфк)\\b", "")
-                .replaceAll("[^a-zа-яё0-9]", "")
+    private String normalize(String name) {
+        if (name == null) return "";
+        return name.toLowerCase()
+                .replaceAll("[^a-zа-яё0-9]", "") // Удаляем всё, кроме букв и цифр
                 .trim();
     }
 }

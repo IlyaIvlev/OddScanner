@@ -1,5 +1,6 @@
 package com.oddscanner.service;
 
+import com.oddscanner.dto.ArbitrageOpportunityDto;
 import com.oddscanner.generated.Tables;
 import com.oddscanner.generated.tables.records.EventsRecord;
 import lombok.RequiredArgsConstructor;
@@ -10,8 +11,8 @@ import org.jooq.Result;
 import org.springframework.stereotype.Service;
 
 import java.math.BigDecimal;
-import java.time.Duration;
 import java.util.*;
+import java.util.stream.Collectors;
 
 @Slf4j
 @Service
@@ -19,186 +20,84 @@ import java.util.*;
 public class ArbFinderService {
 
     private final DSLContext dsl;
-    private final MatchComparator matchComparator;
-    private final OutcomeNormalizer normalizer;
 
-    public List<ArbitrageOpportunity> findArbitrages() {
-        log.info("🔍 Запуск поиска вилок (оптимизированный режим)...");
+    public List<ArbitrageOpportunityDto> findArbitrages() {
+        log.info("🔍 Запуск поиска вилок...");
         long start = System.currentTimeMillis();
 
-        // Сортировка по времени обязательна для работы break по isTimeTooFar
         Result<EventsRecord> events = dsl.selectFrom(Tables.EVENTS)
                 .where(Tables.EVENTS.STATUS.eq("SCHEDULED"))
-                .orderBy(Tables.EVENTS.START_TIME.asc())
                 .fetch();
 
-        log.info(" Загружено {} событий для анализа", events.size());
+        log.info("📊 Загружено {} событий", events.size());
 
-        List<ArbitrageOpportunity> opportunities = new ArrayList<>();
-        int checkedPairs = 0;
+        // Группируем события по нормализованному названию матча
+        Map<String, List<EventsRecord>> matchGroups = events.stream()
+                .collect(Collectors.groupingBy(e -> normalizeMatchName(e.getHomeTeam(), e.getAwayTeam())));
 
-        for (int i = 0; i < events.size(); i++) {
-            EventsRecord e1 = events.get(i);
+        List<ArbitrageOpportunityDto> opportunities = new ArrayList<>();
 
-            if (e1.getLeague() == null || e1.getLeague().isBlank()) continue;
+        for (List<EventsRecord> group : matchGroups.values()) {
+            if (group.size() < 2) continue;
 
-            for (int j = i + 1; j < events.size(); j++) {
-                EventsRecord e2 = events.get(j);
+            for (int i = 0; i < group.size(); i++) {
+                for (int j = i + 1; j < group.size(); j++) {
+                    EventsRecord e1 = group.get(i);
+                    EventsRecord e2 = group.get(j);
 
-                // ОПТИМИЗАЦИЯ 1: Если время слишком далеко - прерываем внутренний цикл
-                // Но делаем исключение для пар с участием Winline из-за кривого времени
-                boolean isWinlinePair =
-                        ("WINLINE".equals(e1.getBookmakerId()) || "WINLINE".equals(e2.getBookmakerId()));
+                    // Пропускаем одного букмекера
+                    if (Objects.equals(e1.getBookmakerId(), e2.getBookmakerId())) continue;
 
-                if (!isWinlinePair) {
-                    long diffMinutes = Math.abs(Duration.between(e1.getStartTime(), e2.getStartTime()).toMinutes());
-                    if (diffMinutes > 30) {
-                        break;
-                    }
-                }
-
-                // ОПТИМИЗАЦИЯ 2: Умное сравнение лиг вместо строгого равенства
-                if (!isSameLeague(e1.getLeague(), e2.getLeague())) {
-                    continue;
-                }
-
-                // Проверяем совпадение команд и разных букмекеров
-                if (matchComparator.isSameMatch(e1, e2) && !e1.getBookmakerId().equals(e2.getBookmakerId())) {
-                    checkMarketsUniversal(e1, e2, opportunities);
-                }
-
-                checkedPairs++;
-                if (checkedPairs % 5000 == 0) {
-                    log.debug("⏳ Проверено пар: {}, найдено вилок: {}", checkedPairs, opportunities.size());
+                    checkMarkets(e1, e2, opportunities);
                 }
             }
         }
 
         long duration = System.currentTimeMillis() - start;
-        log.info("✅ Поиск завершен за {} мс. Найдено {} вилок из {} проверенных пар.",
-                duration, opportunities.size(), checkedPairs);
-
+        log.info("✅ Поиск завершен за {} мс. Найдено {} вилок.", duration, opportunities.size());
         return opportunities;
     }
 
-    /**
-     * Умное сравнение лиг. Позволяет сопоставлять названия вида:
-     * "Австрия. Бундеслига" <-> "Bundesliga" <-> "Futbol. Avstriya. Bundesliga"
-     */
-    private boolean isSameLeague(String l1, String l2) {
-        if (l1 == null || l2 == null) return false;
+    private void checkMarkets(EventsRecord e1, EventsRecord e2, List<ArbitrageOpportunityDto> list) {
+        Map<String, Map<String, BigDecimal>> m1 = getEventOdds(e1.getId());
+        Map<String, Map<String, BigDecimal>> m2 = getEventOdds(e2.getId());
 
-        String n1 = normalizeLeagueForCompare(l1);
-        String n2 = normalizeLeagueForCompare(l2);
+        for (String marketType : m1.keySet()) {
+            if (!m2.containsKey(marketType)) continue;
 
-        if (n1.equals(n2)) return true;
+            Map<String, BigDecimal> odds1 = m1.get(marketType);
+            Map<String, BigDecimal> odds2 = m2.get(marketType);
 
-        // Проверяем вхождение только если длины строк отличаются не более чем в 2 раза
-        // Это отсекает ситуации вроде "cup" vs "super cup league"
-        if (n1.length() > 4 && n2.length() > 4) {
-            String shorter = n1.length() < n2.length() ? n1 : n2;
-            String longer = n1.length() < n2.length() ? n2 : n1;
+            if ("1X2".equals(marketType)) {
+                BigDecimal k1 = max(odds1.get("1"), odds2.get("1"));
+                BigDecimal kX = max(odds1.get("X"), odds2.get("X"));
+                BigDecimal k2 = max(odds1.get("2"), odds2.get("2"));
 
-            if (longer.length() <= shorter.length() * 2 && longer.contains(shorter)) {
-                return true;
-            }
-        }
+                if (k1 != null && kX != null && k2 != null) {
+                    double margin = 1.0 / k1.doubleValue() + 1.0 / kX.doubleValue() + 1.0 / k2.doubleValue();
 
-        return false;
-    }
+                    if (margin < 1.0) {
+                        double profit = (1.0 / margin - 1) * 100;
 
-    private String normalizeLeagueForCompare(String league) {
-        if (league == null) return "";
-        return league.toLowerCase()
-                .replaceAll("[^a-zа-яё0-9]", "")
-                .trim();
-    }
-
-    private void checkMarketsUniversal(EventsRecord e1, EventsRecord e2, List<ArbitrageOpportunity> list) {
-        Map<String, Map<String, BigDecimal>> m1 = getNormalizedEventMap(e1.getId());
-        Map<String, Map<String, BigDecimal>> m2 = getNormalizedEventMap(e2.getId());
-
-        // Логируем только если у обоих есть хоть какие-то рынки после нормализации
-        if (!m1.isEmpty() && !m2.isEmpty()) {
-            log.debug("🔎 Сравниваем: {} vs {} | Лига: {} | Рынки F: {} | Рынки W: {}",
-                    e1.getHomeTeam(), e2.getHomeTeam(), e1.getLeague(), m1.keySet(), m2.keySet());
-        } else {
-            // Если рынков нет - скорее всего парсер не смог их распарсить
-            log.trace("⚠️ Пустые рынки для пары: {} ({}) vs {} ({})",
-                    e1.getHomeTeam(), e1.getBookmakerId(), e2.getHomeTeam(), e2.getBookmakerId());
-        }
-
-        for (String type : m1.keySet()) {
-            if (m2.containsKey(type)) {
-                double margin = calculateMarginByType(type, m1.get(type), m2.get(type));
-
-                // Показываем все матчи с маржой близкой к вилке (< 1.05)
-                if (margin < 1.05) {
-                    log.info("🎯 Близкая ситуация ({}) для {} vs {}: Margin={}",
-                            type, e1.getHomeTeam(), e2.getHomeTeam(), String.format("%.4f", margin));
-                }
-
-                if (margin < 1.0) {
-                    addArb(list, e1, e2, type, margin);
-                }
-            }
-        }
-    }
-
-    private double calculateMarginByType(String type, Map<String, BigDecimal> b1, Map<String, BigDecimal> b2) {
-        return switch (type) {
-            case OutcomeNormalizer.TYPE_1X2 -> calc1x2(b1, b2);
-            case OutcomeNormalizer.TYPE_TOTAL -> calcOppositePairs(b1, b2, "OVER_", "UNDER_");
-            case OutcomeNormalizer.TYPE_HANDICAP -> calcOppositeHandicaps(b1, b2);
-            default -> 1.0;
-        };
-    }
-
-    private double calc1x2(Map<String, BigDecimal> b1, Map<String, BigDecimal> b2) {
-        BigDecimal k1 = max(b1.get("1"), b2.get("1"));
-        BigDecimal kX = max(b1.get("X"), b2.get("X"));
-        BigDecimal k2 = max(b1.get("2"), b2.get("2"));
-        if (k1 == null || kX == null || k2 == null) return 1.0;
-        return 1.0 / k1.doubleValue() + 1.0 / kX.doubleValue() + 1.0 / k2.doubleValue();
-    }
-
-    private double calcOppositePairs(Map<String, BigDecimal> b1, Map<String, BigDecimal> b2, String prefix1, String prefix2) {
-        double minMargin = 1.0;
-        for (String key : b1.keySet()) {
-            if (key.startsWith(prefix1)) {
-                String val = key.replace(prefix1, "");
-                String opposite = prefix2 + val;
-
-                BigDecimal o1 = b1.get(key);
-                BigDecimal o2 = b2.get(opposite);
-
-                if (o1 != null && o2 != null) {
-                    double m = 1.0 / o1.doubleValue() + 1.0 / o2.doubleValue();
-                    minMargin = Math.min(minMargin, m);
-                }
-            }
-        }
-        return minMargin;
-    }
-
-    private double calcOppositeHandicaps(Map<String, BigDecimal> b1, Map<String, BigDecimal> b2) {
-        double minMargin = 1.0;
-        for (String k1 : b1.keySet()) {
-            for (String k2 : b2.keySet()) {
-                if (isOppositeHandicapKeys(k1, k2)) {
-                    BigDecimal o1 = b1.get(k1);
-                    BigDecimal o2 = b2.get(k2);
-                    if (o1 != null && o2 != null) {
-                        double m = 1.0 / o1.doubleValue() + 1.0 / o2.doubleValue();
-                        minMargin = Math.min(minMargin, m);
+                        // ВАЖНО: Передаем ВСЕ 9 параметров, включая URL
+                        list.add(new ArbitrageOpportunityDto(
+                                e1.getHomeTeam() + " vs " + e1.getAwayTeam(),
+                                marketType,
+                                Math.round(profit * 100.0) / 100.0,
+                                getBookmakerName(e1.getBookmakerId()),
+                                k1,
+                                e1.getEventUrl(),   // <-- Добавлено
+                                getBookmakerName(e2.getBookmakerId()),
+                                k2,
+                                e2.getEventUrl()    // <-- Добавлено
+                        ));
                     }
                 }
             }
         }
-        return minMargin;
     }
 
-    private Map<String, Map<String, BigDecimal>> getNormalizedEventMap(Long eventId) {
+    private Map<String, Map<String, BigDecimal>> getEventOdds(Long eventId) {
         Result<Record3<String, String, BigDecimal>> records = dsl
                 .select(Tables.MARKETS.MARKET_TYPE, Tables.OUTCOMES.OUTCOME_NAME, Tables.OUTCOMES.ODDS)
                 .from(Tables.MARKETS)
@@ -209,46 +108,43 @@ public class ArbFinderService {
 
         Map<String, Map<String, BigDecimal>> result = new HashMap<>();
         for (var r : records) {
-            OutcomeNormalizer.MarketKey key = normalizer.normalize(
-                    r.get(Tables.MARKETS.MARKET_TYPE),
-                    r.get(Tables.OUTCOMES.OUTCOME_NAME)
-            );
+            String type = r.get(Tables.MARKETS.MARKET_TYPE);
+            String outcome = r.get(Tables.OUTCOMES.OUTCOME_NAME);
+            BigDecimal odds = r.get(Tables.OUTCOMES.ODDS);
 
-            if (key != null) {
-                result.computeIfAbsent(key.type(), k -> new HashMap<>())
-                        .merge(key.outcome(), r.get(Tables.OUTCOMES.ODDS), BigDecimal::max);
+            String normalizedOutcome = switch (outcome.toUpperCase()) {
+                case "П1", "1", "HOME" -> "1";
+                case "Х", "X", "DRAW" -> "X";
+                case "П2", "2", "AWAY" -> "2";
+                default -> null;
+            };
+
+            if (normalizedOutcome != null && "1X2".equals(type)) {
+                result.computeIfAbsent(type, k -> new HashMap<>())
+                        .merge(normalizedOutcome, odds, BigDecimal::max);
             }
         }
         return result;
     }
 
-    private boolean isOppositeHandicapKeys(String k1, String k2) {
-        try {
-            String[] p1 = k1.split("_");
-            String[] p2 = k2.split("_");
-            if (p1.length < 2 || p2.length < 2) return false;
-
-            int t1 = Integer.parseInt(p1[0].replace("H", ""));
-            int t2 = Integer.parseInt(p2[0].replace("H", ""));
-
-            double v1 = Double.parseDouble(p1[1]);
-            double v2 = Double.parseDouble(p2[1]);
-
-            return (t1 != t2) && (Math.abs(v1 + v2) < 0.01);
-        } catch (Exception e) {
-            return false;
-        }
-    }
-
-    private void addArb(List<ArbitrageOpportunity> list, EventsRecord e1, EventsRecord e2, String market, double margin) {
-        double profit = (1.0 / margin - 1) * 100;
-        list.add(new ArbitrageOpportunity(e1, e2, market, Math.round(profit * 100.0) / 100.0));
+    private String normalizeMatchName(String home, String away) {
+        String h = home.toLowerCase().replaceAll("[^a-zа-яё0-9]", "").trim();
+        String a = away.toLowerCase().replaceAll("[^a-zа-яё0-9]", "").trim();
+        return h.compareTo(a) <= 0 ? h + "|" + a : a + "|" + h;
     }
 
     private BigDecimal max(BigDecimal... vals) {
-        return Arrays.stream(vals).filter(Objects::nonNull).max(BigDecimal::compareTo).orElse(null);
+        return Arrays.stream(vals)
+                .filter(Objects::nonNull)
+                .max(BigDecimal::compareTo)
+                .orElse(null);
     }
 
-    public record ArbitrageOpportunity(EventsRecord e1, EventsRecord e2, String market, double profit) {
+    private String getBookmakerName(Long bookmakerId) {
+        if (bookmakerId == null) return "Unknown";
+        return dsl.select(Tables.BOOKMAKERS.NAME)
+                .from(Tables.BOOKMAKERS)
+                .where(Tables.BOOKMAKERS.ID.eq(bookmakerId))
+                .fetchOneInto(String.class);
     }
 }

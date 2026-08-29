@@ -399,24 +399,48 @@ public class WinlineParser extends AbstractBookmakerParser {
 
     // --- МЕТОД ИЗВЛЕЧЕНИЯ ЛИГИ ИЗ URL ---
     private String extractLeagueFromUrl(String url) {
-        if (url == null) return "Неизвестная лига";
-        String path = url.replace(BASE_URL, "");
-        String[] parts = path.split("/");
-
-        boolean foundSport = false;
-        StringBuilder leagueBuilder = new StringBuilder();
-        for (String part : parts) {
-            if (foundSport) {
-                if (!part.isEmpty() && !part.matches("\\d+")) {
-                    if (leagueBuilder.length() > 0) leagueBuilder.append(". ");
-                    leagueBuilder.append(Character.toUpperCase(part.charAt(0))).append(part.substring(1));
-                }
-            }
-            if (part.equals("sport") || part.equals("live")) foundSport = true;
+        if (url == null || !url.contains("/stavki/sport/")) {
+            log.warn("[Winline] Невалидный URL для определения лиги: {}", url);
+            return "Неизвестная лига";
         }
 
-        String result = leagueBuilder.toString();
-        return result.isEmpty() ? "Неизвестная лига" : result;
+        try {
+            // Пример URL: https://winline.ru/stavki/sport/futbol/rossiya/premer-liga
+            // Или: https://winline.ru/stavki/sport/futbol/germaniya/bundesliga/12345
+            String path = url.replace(BASE_URL, "").replace("/stavki/sport/", "");
+            String[] parts = path.split("/");
+
+            // parts[0] = вид спорта (futbol)
+            // parts[1] = страна/регион (rossiya)
+            // parts[2] = лига (premer-liga)
+            // parts[3+] = ID события или доп. параметры
+
+            if (parts.length >= 3) {
+                StringBuilder leagueBuilder = new StringBuilder();
+                for (int i = 1; i < Math.min(parts.length, 4); i++) {
+                    String part = parts[i];
+                    // Пропускаем числовые ID событий
+                    if (part.matches("\\d+")) continue;
+
+                    if (leagueBuilder.length() > 0) leagueBuilder.append(". ");
+                    // Делаем первую букву заглавной, остальные строчными
+                    leagueBuilder.append(Character.toUpperCase(part.charAt(0)))
+                            .append(part.substring(1).toLowerCase());
+                }
+
+                String result = leagueBuilder.toString();
+                if (!result.isEmpty()) return result;
+            }
+
+            // Fallback: если лига не определилась, берём хотя бы вид спорта
+            String sport = parts[0].substring(0, 1).toUpperCase() + parts[0].substring(1);
+            log.warn("[Winline] Не удалось определить лигу из URL: {}. Используем спорт: {}", url, sport);
+            return sport;
+
+        } catch (Exception e) {
+            log.error("[Winline] Ошибка при определении лиги из URL: {}", url, e);
+            return "Неизвестная лига";
+        }
     }
 
     // --- МЕТОД ПАРСИНГА ВРЕМЕНИ (без логов внутри) ---
