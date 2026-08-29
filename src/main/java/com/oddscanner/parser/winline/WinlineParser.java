@@ -57,7 +57,7 @@ public class WinlineParser extends AbstractBookmakerParser {
             "/stavki/sport/boks/professionalnyy-boks"
     );
 
-    private static final int PARALLELISM = 5;
+    private static final int PARALLELISM = 3;
 
     private record EventLink(String href, String text) {}
 
@@ -93,11 +93,11 @@ public class WinlineParser extends AbstractBookmakerParser {
             futures.add(future);
         }
 
-        try { CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).get(120, TimeUnit.SECONDS); }
-        catch (Exception e) { log.warn("[Winline] Таймаут или ошибка ожидания: {}", e.getMessage()); }
+        try { CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).get(180, TimeUnit.SECONDS); } // Увеличил общий таймаут до 3 минут
+        catch (Exception e) { log.warn("[Winline] Таймаут ожидания завершения парсинга: {}", e.getMessage()); }
 
         executor.shutdown();
-        try { if (!executor.awaitTermination(10, TimeUnit.SECONDS)) executor.shutdownNow(); }
+        try { if (!executor.awaitTermination(15, TimeUnit.SECONDS)) executor.shutdownNow(); }
         catch (InterruptedException e) { executor.shutdownNow(); }
 
         long duration = System.currentTimeMillis() - startTime;
@@ -109,6 +109,8 @@ public class WinlineParser extends AbstractBookmakerParser {
             Set<String> activeExternalIds = resultList.stream().map(RawEvent::externalId).collect(Collectors.toSet());
             eventRepository.markInactiveEvents("WINLINE", activeExternalIds);
             log.info("[Winline] СОХРАНЕНО {} событий", resultList.size());
+        } else {
+            log.warn("[Winline] Не удалось собрать ни одного события! Проверьте доступность сайта.");
         }
         return resultList;
     }
@@ -124,14 +126,52 @@ public class WinlineParser extends AbstractBookmakerParser {
                     try {
                         String url = BASE_URL + sportPath;
                         log.info("[Winline] Сбор лиг с: {}", url);
+
                         try (BrowserContext context = browser.newContext(createContextOptions());
                              Page page = context.newPage()) {
+
                             addStealthScripts(page);
-                            page.navigate(url, new Page.NavigateOptions().setTimeout(15_000).setWaitUntil(WaitUntilState.DOMCONTENTLOADED));
+
+                            // Попытка навигации с фоллбэком
+                            boolean navigated = false;
+                            try {
+                                page.navigate(url, new Page.NavigateOptions()
+                                        .setTimeout(60_000)
+                                        .setWaitUntil(WaitUntilState.COMMIT));
+                                navigated = true;
+                            } catch (Exception e) {
+                                if (e.getMessage() != null &&
+                                        (e.getMessage().contains("Timeout") || e.getMessage().contains("ERR_TIMED_OUT"))) {
+                                    log.warn("[Winline] Таймаут COMMIT на {}, пробую DOMCONTENTLOADED...", url);
+                                    try {
+                                        page.navigate(url, new Page.NavigateOptions()
+                                                .setTimeout(60_000)
+                                                .setWaitUntil(WaitUntilState.DOMCONTENTLOADED));
+                                        navigated = true;
+                                    } catch (Exception fallbackEx) {
+                                        log.error("[Winline] Fallback навигация не удалась для {}: {}", url, fallbackEx.getMessage());
+                                    }
+                                } else {
+                                    throw e;
+                                }
+                            }
+
+                            if (!navigated) continue;
+
                             closePopups(page);
-                            Thread.sleep(300);
+
+                            // Дополнительное ожидание для ночной загрузки JS
+                            Thread.sleep(1000);
                             autoScroll(page);
-                            Thread.sleep(200);
+                            Thread.sleep(1000);
+
+                            // Проверка, есть ли вообще контент на странице
+                            String bodyText = page.innerText("body");
+                            if (bodyText == null || bodyText.length() < 100) {
+                                log.warn("[Winline] Страница {} выглядит пустой или не загрузилась (длина текста: {}). Пропускаем.",
+                                        url, bodyText == null ? 0 : bodyText.length());
+                                continue;
+                            }
 
                             List<String> discovered = discoverLeagues(page, sportPath);
                             discoveredLeagues.addAll(discovered);
@@ -140,10 +180,14 @@ public class WinlineParser extends AbstractBookmakerParser {
                             addToGlobalMap(new HashMap<>(), events);
                             log.info("[Winline] На корневой {} найдено {} событий", sportPath, events.size());
                         }
-                    } catch (Exception e) { log.warn("[Winline] Ошибка сбора лиг с {}: {}", sportPath, e.getMessage()); }
+                    } catch (Exception e) {
+                        log.error("[Winline] Критическая ошибка при сборе лиг с {}: {}", sportPath, e.getMessage());
+                    }
                 }
             }
-        } catch (Exception e) { log.error("[Winline] Ошибка сбора URL: {}", e.getMessage()); }
+        } catch (Exception e) {
+            log.error("[Winline] Ошибка создания браузера: {}", e.getMessage());
+        }
 
         for (String sportPath : SPORT_PATHS) allUrls.add(BASE_URL + sportPath);
         allUrls.addAll(discoveredLeagues);
@@ -159,16 +203,40 @@ public class WinlineParser extends AbstractBookmakerParser {
             Browser browser = playwright.chromium().launch(createLaunchOptions());
             try (BrowserContext context = browser.newContext(createContextOptions());
                  Page page = context.newPage()) {
+
                 addStealthScripts(page);
-                page.navigate(url, new Page.NavigateOptions().setTimeout(15_000).setWaitUntil(WaitUntilState.DOMCONTENTLOADED));
+
+                boolean navigated = false;
+                try {
+                    page.navigate(url, new Page.NavigateOptions()
+                            .setTimeout(45_000)
+                            .setWaitUntil(WaitUntilState.COMMIT));
+                    navigated = true;
+                } catch (Exception e) {
+                    if (e.getMessage() != null &&
+                            (e.getMessage().contains("Timeout") || e.getMessage().contains("ERR_TIMED_OUT"))) {
+                        try {
+                            page.navigate(url, new Page.NavigateOptions()
+                                    .setTimeout(45_000)
+                                    .setWaitUntil(WaitUntilState.DOMCONTENTLOADED));
+                            navigated = true;
+                        } catch (Exception ignored) {}
+                    }
+                }
+
+                if (!navigated) {
+                    log.warn("[Winline] Не удалось перейти на {}. Пропускаем.", url);
+                    return;
+                }
+
                 closePopups(page);
-                Thread.sleep(200);
                 autoScroll(page);
-                Thread.sleep(100);
+                Thread.sleep(500);
 
                 List<RawEvent> events = parseCurrentPage(page);
-                // Логируем только если есть события или произошла ошибка
                 if (!events.isEmpty()) log.info("[Winline] {} -> {} событий", url, events.size());
+                else log.debug("[Winline] {} -> 0 событий (возможно, ночь или нет матчей)", url);
+
                 addToGlobalMap(globalEventsMap, events);
             } catch (Exception e) { log.warn("[Winline] Ошибка парсинга {}: {}", url, e.getMessage()); }
         } catch (Exception e) { log.warn("[Winline] Ошибка браузера для {}: {}", url, e.getMessage()); }
@@ -210,7 +278,7 @@ public class WinlineParser extends AbstractBookmakerParser {
 
     private Browser.NewContextOptions createContextOptions() {
         return new Browser.NewContextOptions()
-                .setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36")
+                .setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36")
                 .setLocale("ru-RU").setTimezoneId("Europe/Moscow").setViewportSize(1920, 1080);
     }
 
@@ -238,8 +306,11 @@ public class WinlineParser extends AbstractBookmakerParser {
     private List<RawEvent> parseCurrentPage(Page page) {
         List<RawEvent> events = new ArrayList<>();
         try {
-            try { page.waitForSelector("text=/\\d+\\.\\d{2}/", new Page.WaitForSelectorOptions().setTimeout(4_000)); }
-            catch (Exception e) { return events; }
+            try { page.waitForSelector("text=/\\d+\\.\\d{2}/", new Page.WaitForSelectorOptions().setTimeout(5_000)); }
+            catch (Exception e) {
+                log.debug("[Winline] Не найден селектор коэффициентов на {}. Возможно, нет активных матчей.", page.url());
+                return events;
+            }
 
             List<EventLink> eventLinks = extractEventLinks(page, page.url());
             String pageText = page.innerText("body");
@@ -311,14 +382,13 @@ public class WinlineParser extends AbstractBookmakerParser {
         return null;
     }
 
-    // --- ОПТИМИЗИРОВАННЫЙ МЕТОД ПАРСИНГА ТЕКСТА ---
     private List<RawEvent> parsePageText(String text, List<EventLink> eventLinks, String pageUrl) {
         List<RawEvent> events = new ArrayList<>();
         Set<String> processed = new HashSet<>();
         String[] lines = text.split("\n");
 
         String league = extractLeagueFromUrl(pageUrl);
-        int timeNotFoundCount = 0; // Счетчик пропущенных событий
+        int timeNotFoundCount = 0;
 
         for (int i = 0; i < lines.length - 4; i++) {
             String line1 = lines[i].trim();
@@ -363,7 +433,7 @@ public class WinlineParser extends AbstractBookmakerParser {
 
             LocalDateTime eventTime = parseEventTime(lines, i, team1, team2);
             if (eventTime == null) {
-                timeNotFoundCount++; // Просто считаем, не логируем
+                timeNotFoundCount++;
                 continue;
             }
 
@@ -386,7 +456,6 @@ public class WinlineParser extends AbstractBookmakerParser {
             i = lastOddIdx;
         }
 
-        // Пишем сводку один раз на страницу вместо тысяч строк
         if (timeNotFoundCount > 0) {
             log.warn("[Winline] Страница {}: найдено {} событий, у {} не определено время (fallback)",
                     league, events.size(), timeNotFoundCount);
@@ -397,7 +466,6 @@ public class WinlineParser extends AbstractBookmakerParser {
         return events;
     }
 
-    // --- МЕТОД ИЗВЛЕЧЕНИЯ ЛИГИ ИЗ URL ---
     private String extractLeagueFromUrl(String url) {
         if (url == null || !url.contains("/stavki/sport/")) {
             log.warn("[Winline] Невалидный URL для определения лиги: {}", url);
@@ -405,25 +473,16 @@ public class WinlineParser extends AbstractBookmakerParser {
         }
 
         try {
-            // Пример URL: https://winline.ru/stavki/sport/futbol/rossiya/premer-liga
-            // Или: https://winline.ru/stavki/sport/futbol/germaniya/bundesliga/12345
             String path = url.replace(BASE_URL, "").replace("/stavki/sport/", "");
             String[] parts = path.split("/");
-
-            // parts[0] = вид спорта (futbol)
-            // parts[1] = страна/регион (rossiya)
-            // parts[2] = лига (premer-liga)
-            // parts[3+] = ID события или доп. параметры
 
             if (parts.length >= 3) {
                 StringBuilder leagueBuilder = new StringBuilder();
                 for (int i = 1; i < Math.min(parts.length, 4); i++) {
                     String part = parts[i];
-                    // Пропускаем числовые ID событий
                     if (part.matches("\\d+")) continue;
 
                     if (leagueBuilder.length() > 0) leagueBuilder.append(". ");
-                    // Делаем первую букву заглавной, остальные строчными
                     leagueBuilder.append(Character.toUpperCase(part.charAt(0)))
                             .append(part.substring(1).toLowerCase());
                 }
@@ -432,7 +491,6 @@ public class WinlineParser extends AbstractBookmakerParser {
                 if (!result.isEmpty()) return result;
             }
 
-            // Fallback: если лига не определилась, берём хотя бы вид спорта
             String sport = parts[0].substring(0, 1).toUpperCase() + parts[0].substring(1);
             log.warn("[Winline] Не удалось определить лигу из URL: {}. Используем спорт: {}", url, sport);
             return sport;
@@ -443,7 +501,6 @@ public class WinlineParser extends AbstractBookmakerParser {
         }
     }
 
-    // --- МЕТОД ПАРСИНГА ВРЕМЕНИ (без логов внутри) ---
     private LocalDateTime parseEventTime(String[] lines, int matchIndex, String team1, String team2) {
         LocalDateTime now = LocalDateTime.now();
         LocalDate today = now.toLocalDate();
@@ -481,9 +538,6 @@ public class WinlineParser extends AbstractBookmakerParser {
         }
 
         if (targetTime != null) return LocalDateTime.of(targetDate, targetTime);
-
-        // Возвращаем null, чтобы вызывающий метод мог посчитать статистику
-        // Fallback теперь применяется там, где мы решим (или не применяем вовсе)
         return null;
     }
 
