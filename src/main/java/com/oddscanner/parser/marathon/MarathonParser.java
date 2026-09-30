@@ -364,6 +364,17 @@ public class MarathonParser extends AbstractBookmakerParser {
 
     private String inferMarketType(String rawName, List<RawEvent.RawOutcome> outcomes) {
         if (outcomes == null || outcomes.isEmpty()) return normalizeRawName(rawName);
+
+        // ФИКС: отсекаем гандикапы, которые не должны попасть в 1X2
+        if (rawName != null && (
+                rawName.contains("To_Win_Match_With_Handicap") ||
+                        rawName.contains("Handicap") ||
+                        rawName.contains("Total") ||
+                        rawName.contains("Correct_Score") ||
+                        rawName.contains("Half"))) {
+            return "HANDICAP_OR_OTHER";
+        }
+
         Set<String> names = outcomes.stream().map(o -> o.name().toLowerCase(Locale.ROOT).trim()).collect(Collectors.toSet());
         boolean hasHome = names.stream().anyMatch(n -> n.matches(".*(п1|home|team\\s*1|^1$).*"));
         boolean hasDraw = names.stream().anyMatch(n -> n.matches(".*(x|draw|ничья).*"));

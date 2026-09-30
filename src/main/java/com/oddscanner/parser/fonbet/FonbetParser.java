@@ -220,10 +220,11 @@ public class FonbetParser extends AbstractBookmakerParser {
     }
 
     private String getMarketTypeByFactorId(Integer factorId) {
-        if (factorId == 921 || factorId == 922 || factorId == 923 ||
-                factorId == 924 || factorId == 925 || factorId == 1571) {
-            return "1X2";
-        }
+        // Основной исход
+        if (factorId == 921 || factorId == 922 || factorId == 923) return "1X2";
+        // Двойной шанс — отдельный рынок
+        if (factorId == 924 || factorId == 925 || factorId == 1571) return "DOUBLE_CHANCE";
+
         if (isHandicap1Factor(factorId) || isHandicap2Factor(factorId)) return "Фора";
         if (isTotalFactor(factorId) || isTotalUnderFactor(factorId)) return "Тотал";
         return "Рынок_" + factorId;
@@ -267,8 +268,7 @@ public class FonbetParser extends AbstractBookmakerParser {
             case 924 -> "1X";
             case 925 -> "X2";
             case 1571 -> "12";
-            default ->
-                 "Исход_" + factorId;
+            default -> "Исход_" + factorId;
         };
     }
 
