@@ -42,7 +42,7 @@ jobs:
       #   run: ./mvnw exec:java -e -D exec.mainClass=com.microsoft.playwright.CLI -D exec.args="install --with-deps"
 
       - name: Build with Maven
-        run: ./mvnw clean package -DskipTests
+        run: mvn clean package -DskipTests
         env:
           SPRING_DATASOURCE_URL: jdbc:postgresql://localhost:5433/oddscanner
           SPRING_DATASOURCE_USERNAME: user
