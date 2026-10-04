@@ -25,6 +25,11 @@
         <commons-text.version>1.12.0</commons-text.version>
         <springdoc.version>2.5.0</springdoc.version>
         <argLine>-Dfile.encoding=UTF-8</argLine>
+
+        <!-- jOOQ DB connection (можно переопределить через -D или env) -->
+        <jooq.db.url>jdbc:postgresql://localhost:5433/oddscanner</jooq.db.url>
+        <jooq.db.user>user</jooq.db.user>
+        <jooq.db.password>password</jooq.db.password>
     </properties>
 
     <dependencies>
@@ -72,7 +77,7 @@
         <dependency>
             <groupId>org.liquibase</groupId>
             <artifactId>liquibase-core</artifactId>
-            <version>4.31.1</version>
+            <version>${liquibase.version}</version>
         </dependency>
 
         <!-- Playwright -->
@@ -152,45 +157,58 @@
                 </configuration>
             </plugin>
 
-            <!-- JOOQ плагин -->
+            <!-- jOOQ code generation -->
             <plugin>
                 <groupId>org.jooq</groupId>
                 <artifactId>jooq-codegen-maven</artifactId>
                 <version>${jooq.version}</version>
+                <executions>
+                    <execution>
+                        <id>generate-jooq-sources</id>
+                        <phase>generate-sources</phase>
+                        <goals>
+                            <goal>generate</goal>
+                        </goals>
+                    </execution>
+                </executions>
+                <dependencies>
+                    <dependency>
+                        <groupId>org.postgresql</groupId>
+                        <artifactId>postgresql</artifactId>
+                        <version>42.7.4</version>
+                    </dependency>
+                </dependencies>
                 <configuration>
                     <jdbc>
                         <driver>org.postgresql.Driver</driver>
-                        <url>jdbc:postgresql://localhost:5433/oddscanner</url>
-                        <user>user</user>
-                        <password>password</password>
+                        <url>${jooq.db.url}</url>
+                        <user>${jooq.db.user}</user>
+                        <password>${jooq.db.password}</password>
                     </jdbc>
                     <generator>
                         <database>
                             <name>org.jooq.meta.postgres.PostgresDatabase</name>
                             <inputSchema>public</inputSchema>
                             <includes>.*</includes>
-                            <excludes>.*arbitrages.*|.*arb_leg.*</excludes>
+                            <excludes>databasechangelog|databasechangeloglock|arbitrages|arb_leg</excludes>
                         </database>
                         <target>
                             <packageName>com.oddscanner.generated</packageName>
-                            <directory>${project.basedir}/src/main/java</directory>
+                            <directory>target/generated-sources/jooq</directory>
                         </target>
                     </generator>
                 </configuration>
             </plugin>
 
-            <!-- Liquibase Maven Plugin -->
             <plugin>
                 <groupId>org.liquibase</groupId>
                 <artifactId>liquibase-maven-plugin</artifactId>
                 <version>${liquibase.version}</version>
                 <configuration>
-                    <propertyFile>src/main/resources/application.yml</propertyFile>
-                    <propertyFileWillOverride>true</propertyFileWillOverride>
                     <changeLogFile>src/main/resources/db_changelog/db.changelog-master.sql</changeLogFile>
-                    <url>jdbc:postgresql://localhost:5433/oddscanner</url>
-                    <username>user</username>
-                    <password>password</password>
+                    <url>${jooq.db.url}</url>
+                    <username>${jooq.db.user}</username>
+                    <password>${jooq.db.password}</password>
                     <driver>org.postgresql.Driver</driver>
                     <defaultSchemaName>public</defaultSchemaName>
                 </configuration>
