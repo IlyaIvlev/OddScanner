@@ -10,7 +10,6 @@ jobs:
   build:
     runs-on: ubuntu-latest
 
-    # Поднимаем PostgreSQL для тестов, так как у вас в application.yml указан порт 5433
     services:
       postgres:
         image: postgres:15
@@ -37,19 +36,28 @@ jobs:
           distribution: 'temurin'
           cache: maven
 
-      # Если у вас есть тесты, которые используют Playwright, раскомментируйте следующие 3 строки:
-      # - name: Install Playwright Browsers
-      #   run: ./mvnw exec:java -e -D exec.mainClass=com.microsoft.playwright.CLI -D exec.args="install --with-deps"
+      - name: Wait for PostgreSQL
+        run: |
+          for i in {1..30}; do
+            pg_isready -h localhost -p 5433 -U user && break
+            echo "Waiting for postgres..."
+            sleep 2
+          done
+
+      - name: Load database schema
+        run: |
+          PGPASSWORD=password psql -h localhost -p 5433 -U user -d oddscanner -v ON_ERROR_STOP=1 -f src/main/resources/db_changelog/db.changelog-master.sql
+
+      - name: Verify schema loaded
+        run: |
+          PGPASSWORD=password psql -h localhost -p 5433 -U user -d oddscanner -c "\dt"
 
       - name: Build with Maven
-        run: mvn clean package -DskipTests
-        env:
-          SPRING_DATASOURCE_URL: jdbc:postgresql://localhost:5433/oddscanner
-          SPRING_DATASOURCE_USERNAME: user
-          SPRING_DATASOURCE_PASSWORD: password
+        run: mvn -B -X clean package -DskipTests
 
       - name: Upload JAR artifact
         uses: actions/upload-artifact@v4
+        if: success()
         with:
           name: oddscanner-jar
           path: target/*.jar
