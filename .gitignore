@@ -1,0 +1,53 @@
+# ===== Maven =====
+target/
+**/target/
+!.mvn/wrapper/maven-wrapper.jar
+
+# ===== jOOQ generated sources =====
+target/generated-sources/
+**/generated/
+
+# ===== Compiled class files =====
+**/*.class
+
+# ===== JAR/WAR =====
+*.jar
+*.war
+!mvnw
+!mvnw.cmd
+
+# ===== IDE =====
+.idea/
+*.iml
+*.iws
+*.ipr
+.DS_Store
+.vscode/
+*.swp
+*.swo
+
+# ===== OS files =====
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# ===== Logs =====
+*.log
+logs/
+
+# ===== Playwright =====
+playwright/
+.ms-playwright/
+**/playwright-artifacts/
+
+# ===== Local configs =====
+application-local.yml
+application-*.yml
+!application.yml
+!application-default.yml
+
+# ===== Debug / temp files =====
+*.png
+!src/main/resources/**/*.png
+*_debug.html
+powershell.command
